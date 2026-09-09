@@ -1,5 +1,5 @@
 """
-pipeline.py — Motor de datos del Dashboard PottencIA / ODILO.
+pipeline.py: Motor de datos del Dashboard PottencIA / ODILO.
 
 Replica, celda por celda, la lógica del notebook `consumo_contenidos_3.ipynb`
 que genera el deck mensual del comité (carpeta outputs/deck_mensual/<fecha>/).
@@ -121,7 +121,7 @@ def _load_latest(folder: str, pattern: str) -> pd.DataFrame:
 def _fmt_rango(serie_fecha: pd.Series) -> str:
     f = pd.to_datetime(serie_fecha, errors="coerce").dropna()
     if f.empty:
-        return "—"
+        return "s/d"
     return f"{f.min():%d-%b} → {f.max():%d-%b}"
 
 
@@ -176,7 +176,7 @@ def cargar_snapshots_mensuales(cur_path=CUR_PATH, prev_path=PREV_PATH) -> dict:
 
 
 def panorama_kpis(d: dict) -> pd.DataFrame:
-    """SLIDE 1 — 4 KPIs globales, actual vs anterior (fuente: serie diaria de plataforma)."""
+    """SLIDE 1: 4 KPIs globales, actual vs anterior (fuente: serie diaria de plataforma)."""
     filas = [
         ("Horas consumidas",
          d["horas_cur"]["Horas de aprendizaje (SUM)"].sum(),
@@ -214,7 +214,7 @@ def panorama_por_marca(d: dict) -> pd.DataFrame:
 
 
 def tendencias_diarias(d: dict) -> dict:
-    """SLIDE 2 — serie diaria del mes actual (rolling 7d) vs promedio del mes anterior."""
+    """SLIDE 2: serie diaria del mes actual (rolling 7d) vs promedio del mes anterior."""
     h = d["horas_cur"].sort_values("fecha").copy()
     c = d["consumo_mensual_cur"].sort_values("fecha").copy()
     h["rolling_7d"] = h["Horas de aprendizaje (SUM)"].rolling(7, min_periods=1).mean()
@@ -234,7 +234,7 @@ def _horas_por_usuario(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def segmentacion(df_cpu: pd.DataFrame) -> dict:
-    """SLIDE 3 — activación (No activados vs Activados) e intensidad (4 segmentos)."""
+    """SLIDE 3: activación (No activados vs Activados) e intensidad (4 segmentos)."""
     uh = _horas_por_usuario(df_cpu)
     activacion = (uh["segmento"]
                   .replace({s: "Activados" for s in SEG_ORDER})
@@ -264,7 +264,7 @@ def segmentacion_por_marca(d: dict) -> pd.DataFrame:
 
 
 def abandono(df_cpu: pd.DataFrame) -> dict:
-    """SLIDE 4 — distribución de máximo avance (tramo) por (Usuario, LE)."""
+    """SLIDE 4: distribución de máximo avance (tramo) por (Usuario, LE)."""
     d = df_cpu.copy()
     d["avance"] = d["Tramo porcentaje"].map(TRAMO_MAP)
     agg = (d.groupby(["Usuario", "ID de la LE"], as_index=False)
@@ -279,7 +279,7 @@ def abandono(df_cpu: pd.DataFrame) -> dict:
 
 
 def top_les(d: dict, n: int = 5) -> dict:
-    """SLIDE 5 — Top/Bottom LEs por horas y por variación mes vs mes."""
+    """SLIDE 5: Top/Bottom LEs por horas y por variación mes vs mes."""
     def horas_le(df):
         return (df.groupby(["ID de la LE", "Nombre de la LE"], as_index=False)
                 ["Horas de aprendizaje"].sum())
@@ -297,7 +297,7 @@ def top_les(d: dict, n: int = 5) -> dict:
 
 
 # ==================================================================
-# SECCIÓN 2  — estratégica (histórico largo)
+# SECCIÓN 2 : estratégica (histórico largo)
 # ==================================================================
 def _cargar_snapshot_hist(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, usecols=lambda c: c in COLS_MIN)
@@ -470,7 +470,7 @@ def lift_les(periodos: list, panel: pd.DataFrame, ordenes: list) -> pd.DataFrame
 
 
 def serie_diaria_larga(d: dict, hist_serie=None) -> pd.DataFrame:
-    """SLIDE 2A — serie diaria larga (histórico) + previous + current, con rolling y estacional."""
+    """SLIDE 2A: serie diaria larga (histórico) + previous + current, con rolling y estacional."""
     if hist_serie is None:
         if USE_PREPARED:
             hist_serie = pd.read_parquet(os.path.join(PREPARED_DIR, "historico", "serie_larga_horas.parquet"))

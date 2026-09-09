@@ -1,5 +1,5 @@
 """
-preparar_datos.py — Empaqueta los CSV crudos del proveedor en parquet slim.
+preparar_datos.py: Empaqueta los CSV crudos del proveedor en parquet slim.
 
 Convierte ~380 MB de CSV (mnt/data/current, previous y datos_analisis_estrategico_2026)
 en unos pocos MB de parquet dentro de `dashboard/data/`, para que el repo sea
