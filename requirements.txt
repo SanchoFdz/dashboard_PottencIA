@@ -3,3 +3,8 @@ pandas>=2.0
 numpy>=1.24
 plotly>=5.18
 openpyxl>=3.1
+# pyarrow se importa de forma explicita en pipeline._leer_parquet (lectura directa
+# a category). El tope <25 es el mismo que Streamlit Cloud aplica solo: la 25.0.0
+# tiene un segfault conocido (apache/arrow#50471). Mejor fijarlo aqui que depender
+# de que la plataforma lo parchee.
+pyarrow>=14,<25

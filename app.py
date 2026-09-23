@@ -163,12 +163,15 @@ def delta_txt(delta, sufijo="% vs periodo anterior", dec=1):
 # ==================================================================
 # Carga de datos (base pesada cacheada; agregados por marca al vuelo)
 # ==================================================================
-@st.cache_data(show_spinner="Cargando y limpiando los CSV del proveedor…")
+# max_entries=1: la base es una sola y pesada; no tiene sentido guardar copias.
+@st.cache_data(show_spinner="Cargando y limpiando los CSV del proveedor…", max_entries=1)
 def load_base(_token: float):
     return pl.cargar_base()
 
 
-@st.cache_data(show_spinner="Calculando agregados…")
+# max_entries=2: sin tope, pasear por las 4 marcas dejaba 5 resultados completos
+# vivos a la vez. Recalcular cuesta ~1s, la memoria en Cloud cuesta la app.
+@st.cache_data(show_spinner="Calculando agregados…", max_entries=2)
 def compute(_token: float, marcas_key: tuple):
     base = load_base(_token)
     marcas = list(marcas_key) if marcas_key else None

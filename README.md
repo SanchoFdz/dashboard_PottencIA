@@ -135,6 +135,47 @@ del dato, no de una frase.
 instrucciones de actualización semanal: son tarea del equipo de datos, no del lector. Para
 refrescar los números, reemplazar los CSV (ver más arriba) y reiniciar la app.
 
+## Memoria: por qué el dashboard usa `category` (no tocar sin medir)
+
+El 23-Sep-2026 la app desplegada se cayó en Streamlit Community Cloud: renderizaba bien y a los
+dos minutos moría con `healthz: EOF`, sin traceback. Era OOM, no un error de código.
+
+La causa: las columnas de texto se leían como `object`, donde cada celda es un `str` de Python.
+El snapshot de Marzo pesaba **233 MB para 296 k filas (786 bytes por fila)** aunque `Nombre de
+la LE` tuviera 95 valores distintos y `Certificado` solo 2. Los 8 periodos juntos: **1.19 GB**,
+por encima del límite de la plataforma.
+
+El arreglo vive en `pipeline._compactar` / `_leer_parquet`:
+
+- `COLS_CATEGORIA` pasa a `category` las 10 columnas de baja cardinalidad. 786 → **19 bytes por
+  fila**, los 8 periodos de 1.19 GB a **35 MB**.
+- Se lee con `pyarrow.Table.to_pandas(categories=...)`, no con `pd.read_parquet`. El parquet ya
+  guarda estas columnas dictionary-encoded; pasar por `object` y compactar después producía un
+  pico transitorio de ~230 MB por archivo, que era justo lo que mataba el proceso.
+- **El orden de categorías se normaliza a alfabético.** `groupby(observed=True)` ordena los
+  grupos por el orden de la categoría, y leyendo con pyarrow ese orden es el del diccionario
+  interno del archivo: sin normalizar, el orden de las tablas dependía de cómo quedó escrito el
+  parquet.
+- **Los `float` no se tocan.** Bajarlos a `float32` ahorraba 2 MB de 233 y convertía `2694.96`
+  en `2694.959961`. Esas cifras van a la pantalla del comité.
+
+Reglas que hay que respetar al escribir código nuevo sobre estos frames:
+
+- **Todo `groupby` lleva `observed=True`.** Sin él, pandas 2.x usa `observed=False` con
+  categóricas y devuelve el producto cartesiano de todas las categorías; pandas 3.0 cambió el
+  default a `True`. Explícito = mismo resultado en las dos versiones.
+- **Un tramo o etiqueta que se convierte a número pasa por `_avance()`**, que fuerza numérico.
+  `.map()` sobre una categórica devuelve otra categórica y un `.max()` posterior truena.
+- **Los frames ya agregados (decenas de filas) van por `_descat()`** antes de un `merge` externo
+  o un `fillna`: ahí `category` no ahorra nada y rompe (`Cannot setitem on a Categorical with a
+  new category`).
+- Los caches de `app.py` tienen tope (`max_entries`): sin él, pasear por las 4 marcas dejaba 5
+  resultados completos vivos a la vez.
+
+Cualquier cambio en el pipeline se valida con un digest completo de `computar` (todas las
+marcas, todas las secciones) comparado contra el estado anterior: el arreglo entero se hizo
+verificando que el hash no cambiara ni un dígito.
+
 ## Arquitectura
 
 - **`pipeline.py`**: motor de datos puro (sin Streamlit). Replica celda por celda las

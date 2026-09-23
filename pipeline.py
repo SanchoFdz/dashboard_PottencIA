@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+import gc
 import glob
 import datetime as dt
 from collections import defaultdict
@@ -193,14 +194,71 @@ def _fmt_rango(serie_fecha: pd.Series) -> str:
     return f"{f.min():%d-%b} → {f.max():%d-%b}"
 
 
+# Columnas de texto con poquisimos valores distintos (4 a 120 sobre cientos de
+# miles de filas). En object cada celda es un str de Python: el snapshot de
+# Marzo pesaba 233 MB, 786 bytes por fila, y los 8 periodos juntos 1.19 GB.
+# Streamlit Community Cloud corta en ~1 GB, asi que el proceso moria por OOM.
+# Con category se guarda un codigo entero por fila y el diccionario una sola
+# vez. Todos los groupby llevan observed=True, asi que la conversion no cambia
+# ningun resultado (verificado con un digest completo de `computar`).
+COLS_CATEGORIA = ("Usuario", "ID de la LE", "Nombre de la LE", "Tramo porcentaje",
+                  "Universidad", "Plantilla", "Nivel", "Certificado", "Centro",
+                  "Fecha de creación")
+
+
+def _compactar(df: pd.DataFrame) -> pd.DataFrame:
+    """Pasa a category las columnas de baja cardinalidad y encoge los numericos."""
+    if df is None or df.empty:
+        return df
+    for c in COLS_CATEGORIA:
+        if c not in df.columns:
+            continue
+        if df[c].dtype == object:
+            df[c] = df[c].astype("category")
+        if isinstance(df[c].dtype, pd.CategoricalDtype):
+            # Orden de categorias SIEMPRE alfabetico. groupby(observed=True) ordena
+            # los grupos por el orden de la categoria, y al leer con pyarrow ese
+            # orden es el del diccionario interno del parquet: dejaba el orden de
+            # las tablas a merced de como quedo escrito el archivo.
+            cats = sorted(df[c].cat.categories)
+            if list(df[c].cat.categories) != cats:
+                df[c] = df[c].cat.reorder_categories(cats)
+    for c in df.select_dtypes(include=["int64"]).columns:
+        df[c] = pd.to_numeric(df[c], downcast="integer")
+    # Los float NO se tocan: bajar a float32 cambiaba 2694.96 por 2694.959961 y
+    # esas cifras van a la pantalla del comite. El ahorro eran 2 MB de 233.
+    return df
+
+
+def _leer_parquet(path: str) -> pd.DataFrame:
+    """Lee un parquet ya en category, sin pasar por object.
+
+    pd.read_parquet materializa cada celda como str de Python y recien despues
+    podriamos compactar: ese pico transitorio (~230 MB por snapshot) es lo que
+    disparaba el OOM, aunque el estado estable fuera pequenno. El parquet ya
+    guarda estas columnas dictionary-encoded, asi que to_pandas(categories=...)
+    construye la categoria directo desde el diccionario.
+    """
+    try:
+        import pyarrow.parquet as pq
+        tabla = pq.read_table(path)
+        cats = [c for c in COLS_CATEGORIA if c in tabla.column_names]
+        df = tabla.to_pandas(categories=cats)
+        del tabla
+        return _compactar(df)
+    except ImportError:
+        return _compactar(pd.read_parquet(path))
+
+
+
 # ==================================================================
 # CARGA CRUDA  (Sección 1 del notebook: current vs previous)
 # ==================================================================
 def _cargar_snapshots_prepared() -> dict:
     """Lee los frames ya limpios/slim en parquet (deployment)."""
     out = {}
-    out["cpu_cur"] = pd.read_parquet(os.path.join(PREPARED_DIR, "current", "snapshot.parquet"))
-    out["cpu_prev"] = pd.read_parquet(os.path.join(PREPARED_DIR, "previous", "snapshot.parquet"))
+    out["cpu_cur"] = _leer_parquet(os.path.join(PREPARED_DIR, "current", "snapshot.parquet"))
+    out["cpu_prev"] = _leer_parquet(os.path.join(PREPARED_DIR, "previous", "snapshot.parquet"))
     for lado, path in [("cur", "current"), ("prev", "previous")]:
         out[f"horas_{lado}"] = pd.read_parquet(os.path.join(PREPARED_DIR, path, "horas.parquet"))
         out[f"consumo_mensual_{lado}"] = pd.read_parquet(os.path.join(PREPARED_DIR, path, "consumo.parquet"))
@@ -226,12 +284,12 @@ def cargar_snapshots_mensuales(cur_path=CUR_PATH, prev_path=PREV_PATH) -> dict:
     out["consumo_mensual_cur"] = _load_latest(cur_path, "Consumo_mensual_*.csv")
     out["usuarios_mensuales_cur"] = _load_latest(cur_path, "Usuarios_mensuales_*.csv")
     out["horas_cur"] = _load_latest(cur_path, "Horas_de_aprendizaje_*.csv")
-    out["cpu_cur"] = limpiar_usuarios(_load_latest(cur_path, "consumo_por_usuario__*.csv"))
+    out["cpu_cur"] = _compactar(limpiar_usuarios(_load_latest(cur_path, "consumo_por_usuario__*.csv")))
 
     out["consumo_mensual_prev"] = _load_latest(prev_path, "Consumo_mensual_*.csv")
     out["usuarios_mensuales_prev"] = _load_latest(prev_path, "Usuarios_mensuales_*.csv")
     out["horas_prev"] = _load_latest(prev_path, "Horas_de_aprendizaje_*.csv")
-    out["cpu_prev"] = limpiar_usuarios(_load_latest(prev_path, "consumo_por_usuario__*.csv"))
+    out["cpu_prev"] = _compactar(limpiar_usuarios(_load_latest(prev_path, "consumo_por_usuario__*.csv")))
 
     for k in ["horas_cur", "horas_prev", "consumo_mensual_cur", "consumo_mensual_prev",
               "usuarios_mensuales_cur", "usuarios_mensuales_prev"]:
@@ -304,7 +362,7 @@ def tendencias_diarias(d: dict) -> dict:
 
 
 def _horas_por_usuario(df: pd.DataFrame) -> pd.DataFrame:
-    uh = df.groupby("Usuario", as_index=False)["Horas de aprendizaje"].sum()
+    uh = df.groupby("Usuario", as_index=False, observed=True)["Horas de aprendizaje"].sum()
     uh["segmento"] = uh["Horas de aprendizaje"].apply(segmentar_horas)
     return uh
 
@@ -339,11 +397,22 @@ def segmentacion_por_marca(d: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+def _avance(serie: pd.Series) -> pd.Series:
+    """Tramo de texto -> numero (10/35/65/90).
+
+    Siempre numerico: si "Tramo porcentaje" viene como category, .map() devuelve
+    otra category y un .max() sobre ella truena con "Cannot perform max with
+    non-ordered Categorical".
+    """
+    return pd.to_numeric(serie.map(TRAMO_MAP), errors="coerce")
+
+
 def abandono(df_cpu: pd.DataFrame) -> dict:
     """SLIDE 4: distribución de máximo avance (tramo) por (Usuario, LE)."""
     d = df_cpu.copy()
-    d["avance"] = d["Tramo porcentaje"].map(TRAMO_MAP)
-    agg = (d.groupby(["Usuario", "ID de la LE"], as_index=False)
+    d["avance"] = _avance(d["Tramo porcentaje"])
+    agg = (d.groupby(["Usuario", "ID de la LE"], as_index=False, observed=True)
            .agg({"avance": "max"}).dropna())
     dist = agg["avance"].value_counts(normalize=True).sort_index()
     return {
@@ -354,13 +423,29 @@ def abandono(df_cpu: pd.DataFrame) -> dict:
     }
 
 
+
+def _descat(df: pd.DataFrame) -> pd.DataFrame:
+    """Devuelve las columnas category a texto plano.
+
+    Se usa en los frames YA agregados (decenas de filas, no cientos de miles),
+    donde el ahorro de category es nulo y en cambio estorba: un merge externo
+    deja NaN en la clave y un fillna posterior truena con "Cannot setitem on a
+    Categorical with a new category".
+    """
+    out = df.copy()
+    for c in out.columns:
+        if isinstance(out[c].dtype, pd.CategoricalDtype):
+            out[c] = out[c].astype(object)
+    return out
+
+
 def top_les(d: dict, n: int = 5) -> dict:
     """SLIDE 5: Top/Bottom LEs por horas y por variación mes vs mes."""
     def horas_le(df):
-        return (df.groupby(["ID de la LE", "Nombre de la LE"], as_index=False)
+        return (df.groupby(["ID de la LE", "Nombre de la LE"], as_index=False, observed=True)
                 ["Horas de aprendizaje"].sum())
-    cur = horas_le(d["cpu_cur"]).rename(columns={"Horas de aprendizaje": "horas_cur"})
-    prev = horas_le(d["cpu_prev"]).rename(columns={"Horas de aprendizaje": "horas_prev"})
+    cur = _descat(horas_le(d["cpu_cur"]).rename(columns={"Horas de aprendizaje": "horas_cur"}))
+    prev = _descat(horas_le(d["cpu_prev"]).rename(columns={"Horas de aprendizaje": "horas_prev"}))
     m = cur.merge(prev[["ID de la LE", "horas_prev"]], on="ID de la LE", how="outer").fillna(0)
     # nombre puede faltar si sólo aparecía en prev
     m["horas_cur"] = m["horas_cur"].astype(float)
@@ -387,7 +472,7 @@ def construir_periodos(d: dict, hist_dir=HIST_DIR) -> list:
         for f in sorted(glob.glob(os.path.join(PREPARED_DIR, "historico", "snapshot_*.parquet"))):
             orden = int(re.search(r"snapshot_(\d+)\.parquet", f).group(1))
             periodos.append({"orden": orden, "label": MESES_ES_INV.get(orden, MES_ABR[orden]),
-                             "df": pd.read_parquet(f)})
+                             "df": _leer_parquet(f)})
     else:
         periodos = _construir_periodos_hist_csv(hist_dir)
     return _cerrar_periodos(periodos, d)
@@ -403,7 +488,7 @@ def _construir_periodos_hist_csv(hist_dir):
         if mes not in MESES_ES:
             continue
         periodos.append({"orden": MESES_ES[mes], "label": mes.capitalize(),
-                         "df": _cargar_snapshot_hist(f)})
+                         "df": _compactar(_cargar_snapshot_hist(f))})
     return periodos
 
 
@@ -428,7 +513,7 @@ def _cerrar_periodos(periodos, d):
 def panel_usuario_mes(periodos: list) -> pd.DataFrame:
     filas = []
     for p in periodos:
-        g = (p["df"].groupby("Usuario")
+        g = (p["df"].groupby("Usuario", observed=True)
              .agg(horas=("Horas de aprendizaje", "sum"),
                   Universidad=("Universidad", "first")).reset_index())
         g["orden"] = p["orden"]
@@ -504,7 +589,7 @@ def lift_les(periodos: list, panel: pd.DataFrame, ordenes: list) -> pd.DataFrame
     for p in periodos:
         dd = p["df"]
         dd = dd[dd["Horas de aprendizaje"] > 0]
-        g = (dd.groupby(["ID de la LE", "Nombre de la LE"])["Usuario"]
+        g = (dd.groupby(["ID de la LE", "Nombre de la LE"], observed=True)["Usuario"]
              .apply(set).reset_index().rename(columns={"Usuario": "users"}))
         g["orden"] = p["orden"]
         cons_le.append(g)
@@ -533,7 +618,7 @@ def lift_les(periodos: list, panel: pd.DataFrame, ordenes: list) -> pd.DataFrame
     lift = pd.DataFrame(registros)
     if lift.empty:
         return lift
-    lift_le = (lift.groupby(["ID de la LE", "Nombre de la LE"])
+    lift_le = (lift.groupby(["ID de la LE", "Nombre de la LE"], observed=True)
                .apply(lambda g: pd.Series({
                    "n_total": g["n"].sum(),
                    "retorno_medio": np.average(g["retorno"], weights=g["n"]),
@@ -541,7 +626,8 @@ def lift_les(periodos: list, panel: pd.DataFrame, ordenes: list) -> pd.DataFrame
                       include_groups=False)
                .reset_index()
                .query("n_total >= @MIN_CONS_LE")
-               .sort_values("lift_pp", ascending=False))
+               .sort_values(["lift_pp", "n_total", "ID de la LE"],
+                            ascending=[False, False, True]))
     return lift_le
 
 
@@ -637,14 +723,17 @@ def lift_estrategico(periodos: list, panel: pd.DataFrame, ordenes: list, marcas=
     for p in periodos:
         df = _filtrar_marca(p["df"], marcas)
         act = df[df["Horas de aprendizaje"] > 0]
-        g = act.groupby(["ID de la LE", "Nombre de la LE"])["Usuario"].apply(set)
+        g = act.groupby(["ID de la LE", "Nombre de la LE"], observed=True)["Usuario"].apply(set)
         d = {}
         for (idle, nom), s in g.items():
             d[idle] = s
             name_map[idle] = nom
         activos_le[p["orden"]] = d
 
-    todas = set().union(*[set(activos_le[o]) for o in ordenes]) if ordenes else set()
+    # sorted(): iterar el set directamente hacia el orden de hash de Python, que
+    # cambia entre corridas. Con empates en lift_pp el ranking de gancho/callejon
+    # salia distinto sin que cambiara ni un dato.
+    todas = sorted(set().union(*[set(activos_le[o]) for o in ordenes])) if ordenes else []
     rows = []
     for le in todas:
         num = den = 0
@@ -659,7 +748,12 @@ def lift_estrategico(periodos: list, panel: pd.DataFrame, ordenes: list, marcas=
                          "retencion_obs_pct": round(obs, 1),
                          "retencion_esperada_pct": round(base, 1),
                          "lift_pp": round(obs - base, 1)})
-    lift = (pd.DataFrame(rows).sort_values("lift_pp", ascending=False).reset_index(drop=True)
+    # Desempate explicito: a igual lift manda la LE con mas transiciones (mas
+    # evidencia) y, si tambien empatan, el ID. Sin esto el orden entre empates lo
+    # decidia el quicksort y el ranking bailaba entre corridas.
+    lift = (pd.DataFrame(rows)
+            .sort_values(["lift_pp", "n_usuario_transiciones", "ID de la LE"],
+                         ascending=[False, False, True]).reset_index(drop=True)
             if rows else pd.DataFrame(columns=["ID de la LE", "Nombre de la LE",
                                                "n_usuario_transiciones", "retencion_obs_pct",
                                                "retencion_esperada_pct", "lift_pp"]))
@@ -681,7 +775,7 @@ def gateway_estrategico(periodos: list, panel: pd.DataFrame, ordenes: list, base
         nuevos = set(act["Usuario"].unique()) - visto
         sub = act[act["Usuario"].isin(nuevos)].sort_values(
             ["Usuario", "Horas de aprendizaje"], ascending=[True, False])
-        top = sub.groupby("Usuario", as_index=False).first()
+        top = sub.groupby("Usuario", as_index=False, observed=True).first()
         for _, r in top.iterrows():
             le = r["ID de la LE"]
             name_map[le] = r["Nombre de la LE"]
@@ -690,12 +784,15 @@ def gateway_estrategico(periodos: list, panel: pd.DataFrame, ordenes: list, base
                 inicio[le]["num"] += 1
         visto |= set(act["Usuario"].unique())
     rows = []
-    for le, d in inicio.items():
+    for le in sorted(inicio):
+        d = inicio[le]
         if d["den"] >= 100:
             obs = 100 * d["num"] / d["den"]
             rows.append({"ID de la LE": le, "Nombre de la LE": name_map[le], "n": d["den"],
                          "retencion_obs_pct": round(obs, 1), "lift_pp": round(obs - base, 1)})
-    return (pd.DataFrame(rows).sort_values("lift_pp", ascending=False).reset_index(drop=True)
+    return (pd.DataFrame(rows)
+            .sort_values(["lift_pp", "n", "ID de la LE"], ascending=[False, False, True])
+            .reset_index(drop=True)
             if rows else pd.DataFrame(columns=["ID de la LE", "Nombre de la LE", "n",
                                                "retencion_obs_pct", "lift_pp"]))
 
@@ -730,7 +827,7 @@ def cargar_roster() -> pd.DataFrame | None:
     """
     if USE_PREPARED:
         f = os.path.join(PREPARED_DIR, "roster.parquet")
-        return pd.read_parquet(f) if os.path.exists(f) else None
+        return _leer_parquet(f) if os.path.exists(f) else None
     for carpeta in (os.path.join(ROOT, "Nueva data"), CUR_PATH, HIST_DIR):
         files = glob.glob(os.path.join(carpeta, "Listado_de_usuarios*.csv"))
         if files:
@@ -755,7 +852,7 @@ def distribucion_horas(df_cpu: pd.DataFrame) -> dict:
     media describe al top 5% y la mediana al alumno real; el comite necesita
     las dos para no fijar metas sobre el numero equivocado.
     """
-    uh = df_cpu.groupby("Usuario")["Horas de aprendizaje"].sum().sort_values(ascending=False)
+    uh = df_cpu.groupby("Usuario", observed=True)["Horas de aprendizaje"].sum().sort_values(ascending=False)
     act = uh[uh > 0]
     n, tot = len(uh), float(uh.sum())
 
@@ -794,7 +891,7 @@ def embudo_usuarios(df_cpu: pd.DataFrame, roster: pd.DataFrame | None = None,
     un embudo de personas. Este se construye entero sobre usuarios unicos del
     snapshot mas el roster como denominador.
     """
-    uh = df_cpu.groupby("Usuario")["Horas de aprendizaje"].sum()
+    uh = df_cpu.groupby("Usuario", observed=True)["Horas de aprendizaje"].sum()
     filas = []
     if roster is not None and not roster.empty:
         r = _filtrar_marca(roster, marcas)
@@ -849,10 +946,10 @@ def certificacion(df_cpu: pd.DataFrame) -> dict:
     """
     d = df_cpu.copy()
     d["cert"] = d["Certificado"].astype(str).str.strip().str.lower().eq("si")
-    d["avance"] = d["Tramo porcentaje"].map(TRAMO_MAP)
+    d["avance"] = _avance(d["Tramo porcentaje"])
     pares, n_cert = len(d), int(d["cert"].sum())
     usuarios = int(d["Usuario"].nunique())
-    por_usuario = d[d["cert"]].groupby("Usuario").size()
+    por_usuario = d[d["cert"]].groupby("Usuario", observed=True).size()
     fin = d[d["avance"] >= 90]
     # Bandera de calidad de dato: certificado con avance declarado bajo 20%.
     incoherentes = int(((d["cert"]) & (d["avance"] < 20)).sum())
@@ -899,7 +996,7 @@ def certificacion_por_grupo(df_cpu: pd.DataFrame, col: str) -> pd.DataFrame:
     d = df_cpu.copy()
     d["cert"] = d["Certificado"].astype(str).str.strip().str.lower().eq("si")
     filas = []
-    for g, sub in d.groupby(col):
+    for g, sub in d.groupby(col, observed=True):
         c = certificacion(sub)
         filas.append({col: g, "Usuarios": c["usuarios"],
                       "Certificados": c["certificados"],
@@ -920,9 +1017,9 @@ def catalogo_les(df_cpu: pd.DataFrame, df_prev: pd.DataFrame | None = None,
     publique LEs nuevas entran solas.
     """
     d = df_cpu.copy()
-    d["avance"] = d["Tramo porcentaje"].map(TRAMO_MAP)
+    d["avance"] = _avance(d["Tramo porcentaje"])
     d["cert"] = d["Certificado"].astype(str).str.strip().str.lower().eq("si")
-    g = (d.groupby(["ID de la LE", "Nombre de la LE"], as_index=False)
+    g = (d.groupby(["ID de la LE", "Nombre de la LE"], as_index=False, observed=True)
          .agg(horas=("Horas de aprendizaje", "sum"),
               inscripciones=("Usuario", "size"),
               usuarios=("Usuario", "nunique"),
@@ -931,13 +1028,15 @@ def catalogo_les(df_cpu: pd.DataFrame, df_prev: pd.DataFrame | None = None,
               avance_mediana=("avance", "median"),
               plantilla=("Plantilla", "first"),
               creada=("Fecha de creación", "first")))
+    # g son ~100 filas: aqui category no ahorra nada y rompe to_datetime y .max()
+    g = _descat(g)
     g["creada"] = pd.to_datetime(g["creada"], errors="coerce")
     g["horas_por_usuario"] = g["horas"] / g["usuarios"].replace(0, np.nan)
     ref = g["creada"].max()
     g["edad_dias"] = (ref - g["creada"]).dt.days
     g["dormida"] = g["horas"] < umbral_dormida
     if df_prev is not None and not df_prev.empty:
-        pv = (df_prev.groupby("ID de la LE", as_index=False)["Horas de aprendizaje"]
+        pv = (df_prev.groupby("ID de la LE", as_index=False, observed=True)["Horas de aprendizaje"]
               .sum().rename(columns={"Horas de aprendizaje": "horas_prev"}))
         g = g.merge(pv, on="ID de la LE", how="left")
         g["horas_prev"] = g["horas_prev"].fillna(0.0)
@@ -945,7 +1044,7 @@ def catalogo_les(df_cpu: pd.DataFrame, df_prev: pd.DataFrame | None = None,
     g = g.sort_values("horas", ascending=False).reset_index(drop=True)
 
     cohortes = (g.dropna(subset=["creada"]).assign(mes=lambda x: x["creada"].dt.to_period("M"))
-                .groupby("mes", as_index=False)
+                .groupby("mes", as_index=False, observed=True)
                 .agg(les=("ID de la LE", "size"), horas=("horas", "sum"),
                      usuarios=("usuarios", "sum"), dormidas=("dormida", "sum")))
     cohortes["mes_ts"] = cohortes["mes"].dt.to_timestamp()
@@ -965,19 +1064,19 @@ def catalogo_les(df_cpu: pd.DataFrame, df_prev: pd.DataFrame | None = None,
 def formato_plantilla(df_cpu: pd.DataFrame) -> pd.DataFrame:
     """Rendimiento por formato de curso (`Plantilla`): horas por inscripcion."""
     d = df_cpu.copy()
-    d["avance"] = d["Tramo porcentaje"].map(TRAMO_MAP)
+    d["avance"] = _avance(d["Tramo porcentaje"])
     pares = (d.dropna(subset=["avance"])
-             .groupby(["Usuario", "ID de la LE", "Plantilla"], as_index=False)["avance"].max())
-    av = pares.groupby("Plantilla")["avance"].agg(
+             .groupby(["Usuario", "ID de la LE", "Plantilla"], as_index=False, observed=True)["avance"].max())
+    av = pares.groupby("Plantilla", observed=True)["avance"].agg(
         bajo20=lambda s: (s < 20).mean() * 100, alto80=lambda s: (s >= 80).mean() * 100)
-    g = (d.groupby("Plantilla", as_index=False)
+    g = (d.groupby("Plantilla", as_index=False, observed=True)
          .agg(horas=("Horas de aprendizaje", "sum"),
               inscripciones=("Usuario", "size"),
               usuarios=("Usuario", "nunique"),
               les=("ID de la LE", "nunique")))
     g["h_por_inscripcion_media"] = g["horas"] / g["inscripciones"]
-    med = (d.groupby(["Plantilla", "Usuario"])["Horas de aprendizaje"].sum()
-           .groupby("Plantilla").median().rename("h_por_usuario_mediana").reset_index())
+    med = (d.groupby(["Plantilla", "Usuario"], observed=True)["Horas de aprendizaje"].sum()
+           .groupby("Plantilla", observed=True).median().rename("h_por_usuario_mediana").reset_index())
     g = g.merge(med, on="Plantilla", how="left").merge(av, on="Plantilla", how="left")
     return g.sort_values("horas", ascending=False).reset_index(drop=True)
 
@@ -987,25 +1086,25 @@ def por_centro_nivel(df_cpu: pd.DataFrame, roster: pd.DataFrame | None = None,
     """Corte por Centro (inferido del correo) o Nivel, con media y mediana."""
     d = df_cpu.copy()
     d["cert"] = d["Certificado"].astype(str).str.strip().str.lower().eq("si")
-    uh = d.groupby([col, "Usuario"], as_index=False)["Horas de aprendizaje"].sum()
-    g = (uh.groupby(col, as_index=False)
+    uh = d.groupby([col, "Usuario"], as_index=False, observed=True)["Horas de aprendizaje"].sum()
+    g = (uh.groupby(col, as_index=False, observed=True)
          .agg(usuarios=("Usuario", "nunique"),
               horas=("Horas de aprendizaje", "sum"),
               media=("Horas de aprendizaje", "mean"),
               mediana=("Horas de aprendizaje", "median")))
-    act = (uh[uh["Horas de aprendizaje"] > 0].groupby(col)["Usuario"].nunique()
+    act = (uh[uh["Horas de aprendizaje"] > 0].groupby(col, observed=True)["Usuario"].nunique()
            .rename("activados").reset_index())
     g = g.merge(act, on=col, how="left")
     g["activados"] = g["activados"].fillna(0).astype(int)
     g["pct_activados"] = g["activados"] / g["usuarios"] * 100
-    med_act = (uh[uh["Horas de aprendizaje"] > 0].groupby(col)["Horas de aprendizaje"]
+    med_act = (uh[uh["Horas de aprendizaje"] > 0].groupby(col, observed=True)["Horas de aprendizaje"]
                .agg(media_act="mean", mediana_act="median").reset_index())
     g = g.merge(med_act, on=col, how="left")
-    cert = d[d["cert"]].groupby(col)["Usuario"].nunique().rename("usuarios_con_cert").reset_index()
+    cert = d[d["cert"]].groupby(col, observed=True)["Usuario"].nunique().rename("usuarios_con_cert").reset_index()
     g = g.merge(cert, on=col, how="left")
     g["usuarios_con_cert"] = g["usuarios_con_cert"].fillna(0).astype(int)
     if roster is not None and col in roster.columns:
-        lic = roster.groupby(col)["Usuario"].nunique().rename("licencias").reset_index()
+        lic = roster.groupby(col, observed=True)["Usuario"].nunique().rename("licencias").reset_index()
         g = g.merge(lic, on=col, how="left")
         g["pct_licencia_inscrita"] = g["usuarios"] / g["licencias"] * 100
         g["pct_licencia_efectiva"] = g["activados"] / g["licencias"] * 100
@@ -1029,10 +1128,10 @@ def ruta_master(df_cpu: pd.DataFrame, nombres=None) -> dict:
         return None
     d["curso_ruta"] = d["_n"].map(_match)
     en_ruta = d[d["curso_ruta"].notna()].copy()
-    en_ruta["avance"] = en_ruta["Tramo porcentaje"].map(TRAMO_MAP)
+    en_ruta["avance"] = _avance(en_ruta["Tramo porcentaje"])
     en_ruta["cert"] = en_ruta["Certificado"].astype(str).str.strip().str.lower().eq("si")
 
-    por_curso = (en_ruta.groupby("curso_ruta", as_index=False)
+    por_curso = (en_ruta.groupby("curso_ruta", as_index=False, observed=True)
                  .agg(usuarios=("Usuario", "nunique"),
                       horas=("Horas de aprendizaje", "sum"),
                       certificados=("cert", "sum"),
@@ -1040,22 +1139,22 @@ def ruta_master(df_cpu: pd.DataFrame, nombres=None) -> dict:
                       avance_mediana=("avance", "median")))
     por_curso["completado_pct"] = [
         float((en_ruta[(en_ruta["curso_ruta"] == c)]
-               .groupby("Usuario")["avance"].max() >= 90).mean() * 100)
+               .groupby("Usuario", observed=True)["avance"].max() >= 90).mean() * 100)
         for c in por_curso["curso_ruta"]]
     por_curso["orden"] = por_curso["curso_ruta"].map({n: i for i, n in enumerate(nombres)})
     por_curso = por_curso.sort_values("orden").reset_index(drop=True)
 
-    avance_u = en_ruta.groupby(["Usuario", "curso_ruta"])["avance"].max().reset_index()
+    avance_u = en_ruta.groupby(["Usuario", "curso_ruta"], observed=True)["avance"].max().reset_index()
     # "Tocar" un curso es CONSUMIRLO, no estar inscrito en el. La mayoria de los
     # alumnos aparece inscrita en los 18 cursos de la ruta (asignacion masiva),
     # asi que contar filas mide el reparto del administrador, no al alumno.
     con_consumo = en_ruta[en_ruta["Horas de aprendizaje"] > 0]
-    cobertura = (con_consumo.groupby("Usuario")["curso_ruta"].nunique()
+    cobertura = (con_consumo.groupby("Usuario", observed=True)["curso_ruta"].nunique()
                  .reindex(en_ruta["Usuario"].unique()).fillna(0).astype(int))
-    inscritos_u = en_ruta.groupby("Usuario")["curso_ruta"].nunique()
-    completos = (avance_u[avance_u["avance"] >= 90].groupby("Usuario")["curso_ruta"]
+    inscritos_u = en_ruta.groupby("Usuario", observed=True)["curso_ruta"].nunique()
+    completos = (avance_u[avance_u["avance"] >= 90].groupby("Usuario", observed=True)["curso_ruta"]
                  .nunique().reindex(cobertura.index).fillna(0))
-    horas_u = en_ruta.groupby("Usuario")["Horas de aprendizaje"].sum()
+    horas_u = en_ruta.groupby("Usuario", observed=True)["Horas de aprendizaje"].sum()
     return {
         "por_curso": por_curso,
         "n_cursos_ruta": len(nombres),
@@ -1095,6 +1194,9 @@ def cargar_base(cur_path=CUR_PATH, prev_path=PREV_PATH, hist_dir=HIST_DIR) -> di
     ordenes = [p["orden"] for p in periodos]
     panel = panel_usuario_mes(periodos)
     marcas = [m for m in MARCAS_4 if (panel["Universidad"] == m).any()]
+    # La lectura de los 8 snapshots deja bastante basura transitoria. En local da
+    # igual; en Streamlit Community Cloud el limite de RAM es lo que tumbo la app.
+    gc.collect()
     return {
         "d": d,
         "roster": cargar_roster(),
