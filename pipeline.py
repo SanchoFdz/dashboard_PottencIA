@@ -60,6 +60,7 @@ FACTOR_EFECTIVOS = 2
 MIN_CONS_LE = 40   # consumidores mínimos de una LE para entrar al ranking gancho/callejón
 
 COL_USU = "Nº Usuarios efectivos (DISTINCT_COUNT)"
+COL_USU_RAW = "Nº Usuarios efectivos (RAW)"
 COL_ACT = "Nº Usuarios activos (DISTINCT_COUNT)"
 
 MESES_ES = {"enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
@@ -69,8 +70,62 @@ MES_ABR = {1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
            7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic"}
 MESES_ES_INV = {v: k.capitalize() for k, v in MESES_ES.items()}
 
+# Columnas que se conservan de consumo_por_usuario. Las cinco ultimas se
+# descartaban antes y son las que alimentan las secciones de certificacion,
+# catalogo, formato y centro/nivel.
 COLS_MIN = ["Usuario", "Nombre de la LE", "ID de la LE", "Tramo porcentaje",
-            "Horas de aprendizaje", "Nº de contenidos consumidos"]
+            "Horas de aprendizaje", "Nº de contenidos consumidos",
+            "Plantilla", "Nivel", "Certificado", "Centro", "Fecha de creación"]
+
+# Umbrales de consumo por usuario y periodo (el KPI 2 del comite habla de
+# minutos, no de horas: 20 min = 1/3 h).
+UMBRAL_20MIN = 1.0 / 3.0
+
+# Centro inferido del dominio del correo. El proveedor manda la columna
+# "Centro" con ~0.6% de nulos, y el mapeo dominio -> centro es 1 a 1 en toda
+# la base (ningun dominio aparece en dos centros), asi que el dominio rellena
+# los nulos sin inventar nada.
+DOMINIO_CENTRO = {
+    "edu.utc.mx": "Universidad Tres Culturas",
+    "doc.utc.mx": "Universidad Tres Culturas",
+    "utc.mx": "Universidad Tres Culturas",
+    "alumnos.uvt.edu.mx": "Universidad Tres Culturas",
+    "my.ula.edu.mx": "Universidad Latinoamericana",
+    "ula.edu.mx": "Universidad Latinoamericana",
+    "lottus.com": "Universidad Latinoamericana",
+    "lottuseducation.com": "Universidad Latinoamericana",
+    "uane.mx": "Universidad Americana del Noreste",
+    "uane.edu.mx": "Universidad Americana del Noreste",
+    "alumnos.uteg.edu.mx": "Centro Universitario UTEG",
+    "uteg.edu.mx": "Centro Universitario UTEG",
+    "indo.edu.mx": "Colegio Indoamericano",
+    "alumnos.emintermedica.mx": "Escuela de Medicina Intermedica",
+    "doc.emintermedica.mx": "Escuela de Medicina Intermedica",
+}
+
+# Ruta de Master en IA: 18 LEs certificables (lista de Academia, sep-2026).
+# El match con el catalogo se hace por nombre normalizado, no por ID, porque
+# la lista llega en texto; hoy resuelve 18 de 18.
+RUTA_MASTER = [
+    "Bases y conceptos clave de la IA",
+    "Fundamentos del Análisis de Datos",
+    "Principios de data science",
+    "Ética: Uso Responsable de Datos",
+    "Impacto global de la IA",
+    "Fundamentos de Machine Learning",
+    "Lenguaje inteligente: cómo la IA está cambiando la comunicación",
+    "De la Imagen a la Inteligencia: aplicaciones de la visión artificial",
+    "Riesgos y Seguridad en la Inteligencia Artificial",
+    "Metodologías ágiles con IA",
+    "Gestión de proyectos con IA",
+    "Aplicaciones Avanzadas y Ética en el Análisis de Datos Sociales",
+    "Aplicaciones de data science",
+    "Modelos Avanzados y Aplicaciones Prácticas de Machine Learning",
+    "Gobernanza y Regulación de la Inteligencia Artificial",
+    "Transformación organizacional y ventaja competitiva con IA",
+    "Inteligencia de negocios basada en datos e IA",
+    "Aplicaciones de redes neuronales",
+]
 
 SEG_ORDER = ["Exploradores", "Constantes", "Intensivos", "Power users"]
 
@@ -86,9 +141,22 @@ def extraer_universidad(u: str) -> str:
     return "OTRAS"
 
 
+def extraer_centro(u: str) -> str:
+    """Centro a partir del dominio del correo (ver DOMINIO_CENTRO)."""
+    dom = str(u).split("@")[-1].strip().lower()
+    return DOMINIO_CENTRO.get(dom, "OTROS")
+
+
 def limpiar_usuarios(df: pd.DataFrame) -> pd.DataFrame:
     df = df[~df["Usuario"].astype(str).str.contains(FILTRO_TEST, case=False, na=False)].copy()
     df["Universidad"] = df["Usuario"].apply(extraer_universidad)
+    # El Centro se resuelve AQUI, mientras el correo todavia existe: en modo
+    # preparado el Usuario se anonimiza y el dominio ya no seria recuperable.
+    _dom = df["Usuario"].apply(extraer_centro)
+    if "Centro" in df.columns:
+        df["Centro"] = df["Centro"].fillna("").replace("", np.nan).fillna(_dom)
+    else:
+        df["Centro"] = _dom
     return df
 
 
@@ -140,6 +208,10 @@ def _cargar_snapshots_prepared() -> dict:
         out[f"horas_{lado}"]["fecha"] = pd.to_datetime(out[f"horas_{lado}"]["fecha"], errors="coerce")
         out[f"consumo_mensual_{lado}"]["fecha"] = pd.to_datetime(out[f"consumo_mensual_{lado}"]["fecha"], errors="coerce")
         out[f"usuarios_mensuales_{lado}"]["fecha"] = pd.to_datetime(out[f"usuarios_mensuales_{lado}"]["fecha"], errors="coerce")
+    for lado in ("cur", "prev"):
+        u = out[f"usuarios_mensuales_{lado}"]
+        if COL_USU_RAW not in u.columns:      # parquet anterior a esta version
+            u[COL_USU_RAW] = u[COL_USU] * FACTOR_EFECTIVOS
     # usuarios efectivos YA vienen corregidos (÷2) desde preparar_datos → no re-dividir
     out["cur_label"] = _fmt_rango(out["horas_cur"]["fecha"])
     out["prev_label"] = _fmt_rango(out["horas_prev"]["fecha"])
@@ -166,8 +238,12 @@ def cargar_snapshots_mensuales(cur_path=CUR_PATH, prev_path=PREV_PATH) -> dict:
         if "fecha" in out[k].columns:
             out[k]["fecha"] = pd.to_datetime(out[k]["fecha"], errors="coerce")
 
-    # Corrección doble conteo de usuarios efectivos (serie diaria)
+    # Corrección doble conteo de usuarios efectivos (serie diaria).
+    # Se conserva el valor SIN dividir: la razon efectivos/activos que reporta
+    # el portal solo tiene sentido con los dos valores crudos (ver seccion
+    # "Embudo" y el glosario del taller de KPIs).
     for k in ["usuarios_mensuales_cur", "usuarios_mensuales_prev"]:
+        out[k][COL_USU_RAW] = out[k][COL_USU]
         out[k][COL_USU] = out[k][COL_USU] / FACTOR_EFECTIVOS
 
     out["cur_label"] = _fmt_rango(out["horas_cur"]["fecha"])
@@ -625,6 +701,387 @@ def gateway_estrategico(periodos: list, panel: pd.DataFrame, ordenes: list, base
 
 
 # ==================================================================
+# BLOQUE NUEVO (sep-2026): metricas que el deck no tenia
+#   Todas salen de columnas que ya venian en los CSV del proveedor y que el
+#   pipeline descartaba (Plantilla, Nivel, Certificado, Centro, Fecha de
+#   creacion) o de la exportacion "Listado de usuarios" (roster).
+#   Regla transversal: donde hay una distribucion se reportan MEDIA Y MEDIANA.
+#   La media de horas por usuario esta dominada por la cola (el top 5% de
+#   usuarios concentra la mitad de las horas), asi que sola miente.
+# ==================================================================
+def _norm_nombre(s: str) -> str:
+    """Normaliza nombres de LE para casar listas de texto con el catalogo."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9 ]", " ", t)
+    
+
+def _norm_espacios(s: str) -> str:
+    return re.sub(r"\s+", " ", _norm_nombre(s)).strip()
+
+
+def cargar_roster() -> pd.DataFrame | None:
+    """Base de usuarios con licencia (`Listado_de_usuarios__*.csv`).
+
+    Es un acumulado de vida, no de la ventana de 30 dias: sirve como
+    DENOMINADOR (cuanta gente tiene acceso) y para el corte por Centro y
+    Nivel, nunca para sumar horas contra el snapshot del periodo.
+    Devuelve None si la exportacion no esta disponible.
+    """
+    if USE_PREPARED:
+        f = os.path.join(PREPARED_DIR, "roster.parquet")
+        return pd.read_parquet(f) if os.path.exists(f) else None
+    for carpeta in (os.path.join(ROOT, "Nueva data"), CUR_PATH, HIST_DIR):
+        files = glob.glob(os.path.join(carpeta, "Listado_de_usuarios*.csv"))
+        if files:
+            df = pd.read_csv(max(files, key=os.path.getmtime))
+            df = limpiar_usuarios(df)
+            df = df.rename(columns={"Curso": "Nivel",
+                                    "Contenidos consumidos": "Nº de contenidos consumidos"})
+            df["Nivel"] = df["Nivel"].astype(str).str.strip().str.lower().map(
+                {"superior": "Superior", "mediosuperior": "Medio superior",
+                 "medio superior": "Medio superior", "mediasuperior": "Medio superior",
+                 "mediosuperior,superior": "Mixto", "licenciatura": "Superior",
+                 "licenciatura udg": "Superior", "bachillerato udg": "Medio superior"}
+            ).fillna("Sin dato")
+            return df
+    return None
+
+
+def distribucion_horas(df_cpu: pd.DataFrame) -> dict:
+    """Media Y mediana de horas por usuario, mas concentracion de la cola.
+
+    El deck reportaba solo el promedio. Con una distribucion tan sesgada, la
+    media describe al top 5% y la mediana al alumno real; el comite necesita
+    las dos para no fijar metas sobre el numero equivocado.
+    """
+    uh = df_cpu.groupby("Usuario")["Horas de aprendizaje"].sum().sort_values(ascending=False)
+    act = uh[uh > 0]
+    n, tot = len(uh), float(uh.sum())
+
+    def share(p):
+        if not n or tot <= 0:
+            return np.nan
+        k = max(1, int(round(n * p)))
+        return float(uh.head(k).sum() / tot * 100)
+
+    def q(s, v):
+        return float(s.quantile(v)) if len(s) else np.nan
+
+    return {
+        "n_usuarios": n, "n_activados": int(len(act)),
+        "pct_activados": float(len(act) / n * 100) if n else np.nan,
+        "horas_total": tot,
+        "media_todos": float(uh.mean()) if n else np.nan,
+        "mediana_todos": float(uh.median()) if n else np.nan,
+        "media_act": float(act.mean()) if len(act) else np.nan,
+        "mediana_act": float(act.median()) if len(act) else np.nan,
+        "p25_act": q(act, 0.25), "p75_act": q(act, 0.75), "p90_act": q(act, 0.90),
+        "share_top1": share(0.01), "share_top5": share(0.05), "share_top10": share(0.10),
+        "pct_ge20min": float((act >= UMBRAL_20MIN).mean() * 100) if len(act) else np.nan,
+        "pct_ge1h": float((act >= 1).mean() * 100) if len(act) else np.nan,
+        "n_ge20min": int((act >= UMBRAL_20MIN).sum()),
+        "serie_activados": act,
+    }
+
+
+def embudo_usuarios(df_cpu: pd.DataFrame, roster: pd.DataFrame | None = None,
+                    marcas=None) -> pd.DataFrame:
+    """Embudo de usuarios UNICOS: licencia -> inscrito -> efectivo -> profundidad.
+
+    Los "activos" y "efectivos" de la serie diaria son sumas de conteos
+    diarios (usuario-dia), no personas distintas, asi que no pueden entrar en
+    un embudo de personas. Este se construye entero sobre usuarios unicos del
+    snapshot mas el roster como denominador.
+    """
+    uh = df_cpu.groupby("Usuario")["Horas de aprendizaje"].sum()
+    filas = []
+    if roster is not None and not roster.empty:
+        r = _filtrar_marca(roster, marcas)
+        filas.append(("Usuarios con licencia", int(r["Usuario"].nunique()),
+                      "roster acumulado (Listado de usuarios)"))
+    filas += [
+        ("Inscritos a alguna LE en el periodo", int(len(uh)), "snapshot usuario x LE"),
+        ("Efectivos: consumo > 0 h", int((uh > 0).sum()), "snapshot usuario x LE"),
+        ("Con 20 min o más", int((uh >= UMBRAL_20MIN).sum()), "snapshot usuario x LE"),
+        ("Con 1 h o más", int((uh >= 1).sum()), "snapshot usuario x LE"),
+        ("Con 5 h o más", int((uh >= 5).sum()), "snapshot usuario x LE"),
+    ]
+    out = pd.DataFrame(filas, columns=["etapa", "usuarios", "fuente"])
+    base = out["usuarios"].iloc[0]
+    out["pct_base"] = out["usuarios"] / base * 100 if base else np.nan
+    out["pct_paso"] = out["usuarios"] / out["usuarios"].shift(1) * 100
+    return out
+
+
+def activos_vs_efectivos(d: dict) -> dict:
+    """Razon efectivos/activos de la serie diaria del portal (usuario-dia).
+
+    Definicion del proveedor: activo = entro a la plataforma; efectivo = tuvo
+    alguna actividad. Se calcula sobre los valores CRUDOS: la correccion /2 que
+    el deck aplica a los efectivos rompe la razon (la dejaria en ~0.4 por
+    construccion) y esa razon es justo la pregunta de negocio.
+    """
+    out = {}
+    for lado in ("cur", "prev"):
+        u = d[f"usuarios_mensuales_{lado}"]
+        act = float(u[COL_ACT].sum())
+        efe = float(u[COL_USU_RAW].sum()) if COL_USU_RAW in u.columns else float(u[COL_USU].sum()) * FACTOR_EFECTIVOS
+        out[lado] = {
+            "activos_ud": act, "efectivos_ud": efe,
+            "ratio": efe / act * 100 if act else np.nan,
+            "activos_dia_media": float(u[COL_ACT].mean()),
+            "activos_dia_mediana": float(u[COL_ACT].median()),
+            "efectivos_dia_media": efe / len(u) if len(u) else np.nan,
+            "efectivos_dia_mediana": float(u[COL_USU_RAW].median()) if COL_USU_RAW in u.columns else np.nan,
+            "dias": int(len(u)),
+        }
+    return out
+
+
+def certificacion(df_cpu: pd.DataFrame) -> dict:
+    """Certificados obtenidos: la unica metrica de RESULTADO del tablero.
+
+    Ojo con la semantica: `Certificado` NO es un atributo del curso (99 de 112
+    LEs tienen filas Si y No), es si ESE usuario obtuvo el certificado en ESE
+    curso. Por eso es un resultado (correlaciona con llegar al 80-100%), no una
+    palanca: no se puede "poner mas certificados" y esperar mas horas.
+    """
+    d = df_cpu.copy()
+    d["cert"] = d["Certificado"].astype(str).str.strip().str.lower().eq("si")
+    d["avance"] = d["Tramo porcentaje"].map(TRAMO_MAP)
+    pares, n_cert = len(d), int(d["cert"].sum())
+    usuarios = int(d["Usuario"].nunique())
+    por_usuario = d[d["cert"]].groupby("Usuario").size()
+    fin = d[d["avance"] >= 90]
+    # Bandera de calidad de dato: certificado con avance declarado bajo 20%.
+    incoherentes = int(((d["cert"]) & (d["avance"] < 20)).sum())
+    horas_cert = float(d[d["cert"]]["Horas de aprendizaje"].sum())
+    return {
+        "pares": pares, "certificados": n_cert,
+        "tasa_par": n_cert / pares * 100 if pares else np.nan,
+        "usuarios": usuarios,
+        "usuarios_con_cert": int(len(por_usuario)),
+        "tasa_usuario": len(por_usuario) / usuarios * 100 if usuarios else np.nan,
+        "cert_por_usuario_media": float(por_usuario.mean()) if len(por_usuario) else np.nan,
+        "cert_por_usuario_mediana": float(por_usuario.median()) if len(por_usuario) else np.nan,
+        "pares_fin": int(len(fin)),
+        # Entre los pares que SI llegan al tramo 80-100%, cuantos traen
+        # certificado. Se cuenta sobre `fin`, no sobre el total de
+        # certificados: hay certificados declarados con avance bajo 20% (ver
+        # `incoherentes`) y usar el total daba tasas sobre 100%.
+        "tasa_cert_entre_fin": float(fin["cert"].mean() * 100) if len(fin) else np.nan,
+        "incoherentes": incoherentes,
+        "pct_horas_en_cert": horas_cert / float(d["Horas de aprendizaje"].sum()) * 100
+                             if float(d["Horas de aprendizaje"].sum()) else np.nan,
+        "serie_por_usuario": por_usuario,
+    }
+
+
+def certificacion_por_periodo(periodos: list, marcas=None) -> pd.DataFrame:
+    """Evolucion mes a mes de certificados y tasa de certificacion."""
+    filas = []
+    for p in periodos:
+        df = _filtrar_marca(p["df"], marcas)
+        if "Certificado" not in df.columns:
+            continue
+        c = certificacion(df)
+        filas.append({"eje": p["eje"], "label": p["label"],
+                      "Certificados": c["certificados"],
+                      "Usuarios con certificado": c["usuarios_con_cert"],
+                      "Tasa por usuario (%)": round(c["tasa_usuario"], 1),
+                      "Tasa por inscripcion (%)": round(c["tasa_par"], 2)})
+    return pd.DataFrame(filas)
+
+
+def certificacion_por_grupo(df_cpu: pd.DataFrame, col: str) -> pd.DataFrame:
+    """Certificados por marca / centro / nivel, con media y mediana por usuario."""
+    d = df_cpu.copy()
+    d["cert"] = d["Certificado"].astype(str).str.strip().str.lower().eq("si")
+    filas = []
+    for g, sub in d.groupby(col):
+        c = certificacion(sub)
+        filas.append({col: g, "Usuarios": c["usuarios"],
+                      "Certificados": c["certificados"],
+                      "Usuarios con certificado": c["usuarios_con_cert"],
+                      "Tasa por usuario (%)": round(c["tasa_usuario"], 1),
+                      "Cert. por usuario (media)": round(c["cert_por_usuario_media"], 2)
+                      if pd.notna(c["cert_por_usuario_media"]) else np.nan,
+                      "Cert. por usuario (mediana)": c["cert_por_usuario_mediana"]})
+    return pd.DataFrame(filas).sort_values("Certificados", ascending=False)
+
+
+def catalogo_les(df_cpu: pd.DataFrame, df_prev: pd.DataFrame | None = None,
+                 umbral_dormida: float = 1.0) -> dict:
+    """Catalogo por LE con su FECHA DE CREACION: uso vs antiguedad.
+
+    La fecha sale de la propia columna del snapshot, asi que funciona para
+    cualquier fecha de creacion sin listas fijas: cada mes que el proveedor
+    publique LEs nuevas entran solas.
+    """
+    d = df_cpu.copy()
+    d["avance"] = d["Tramo porcentaje"].map(TRAMO_MAP)
+    d["cert"] = d["Certificado"].astype(str).str.strip().str.lower().eq("si")
+    g = (d.groupby(["ID de la LE", "Nombre de la LE"], as_index=False)
+         .agg(horas=("Horas de aprendizaje", "sum"),
+              inscripciones=("Usuario", "size"),
+              usuarios=("Usuario", "nunique"),
+              certificados=("cert", "sum"),
+              avance_medio=("avance", "mean"),
+              avance_mediana=("avance", "median"),
+              plantilla=("Plantilla", "first"),
+              creada=("Fecha de creación", "first")))
+    g["creada"] = pd.to_datetime(g["creada"], errors="coerce")
+    g["horas_por_usuario"] = g["horas"] / g["usuarios"].replace(0, np.nan)
+    ref = g["creada"].max()
+    g["edad_dias"] = (ref - g["creada"]).dt.days
+    g["dormida"] = g["horas"] < umbral_dormida
+    if df_prev is not None and not df_prev.empty:
+        pv = (df_prev.groupby("ID de la LE", as_index=False)["Horas de aprendizaje"]
+              .sum().rename(columns={"Horas de aprendizaje": "horas_prev"}))
+        g = g.merge(pv, on="ID de la LE", how="left")
+        g["horas_prev"] = g["horas_prev"].fillna(0.0)
+        g["delta"] = g["horas"] - g["horas_prev"]
+    g = g.sort_values("horas", ascending=False).reset_index(drop=True)
+
+    cohortes = (g.dropna(subset=["creada"]).assign(mes=lambda x: x["creada"].dt.to_period("M"))
+                .groupby("mes", as_index=False)
+                .agg(les=("ID de la LE", "size"), horas=("horas", "sum"),
+                     usuarios=("usuarios", "sum"), dormidas=("dormida", "sum")))
+    cohortes["mes_ts"] = cohortes["mes"].dt.to_timestamp()
+    cohortes["horas_por_le"] = cohortes["horas"] / cohortes["les"]
+    tot = float(g["horas"].sum())
+    return {
+        "les": g, "cohortes_creacion": cohortes,
+        "n_les": int(len(g)), "n_dormidas": int(g["dormida"].sum()),
+        "horas_total": tot,
+        "share_top5": float(g["horas"].head(5).sum() / tot * 100) if tot else np.nan,
+        "share_top10": float(g["horas"].head(10).sum() / tot * 100) if tot else np.nan,
+        "horas_por_le_media": float(g["horas"].mean()) if len(g) else np.nan,
+        "horas_por_le_mediana": float(g["horas"].median()) if len(g) else np.nan,
+    }
+
+
+def formato_plantilla(df_cpu: pd.DataFrame) -> pd.DataFrame:
+    """Rendimiento por formato de curso (`Plantilla`): horas por inscripcion."""
+    d = df_cpu.copy()
+    d["avance"] = d["Tramo porcentaje"].map(TRAMO_MAP)
+    pares = (d.dropna(subset=["avance"])
+             .groupby(["Usuario", "ID de la LE", "Plantilla"], as_index=False)["avance"].max())
+    av = pares.groupby("Plantilla")["avance"].agg(
+        bajo20=lambda s: (s < 20).mean() * 100, alto80=lambda s: (s >= 80).mean() * 100)
+    g = (d.groupby("Plantilla", as_index=False)
+         .agg(horas=("Horas de aprendizaje", "sum"),
+              inscripciones=("Usuario", "size"),
+              usuarios=("Usuario", "nunique"),
+              les=("ID de la LE", "nunique")))
+    g["h_por_inscripcion_media"] = g["horas"] / g["inscripciones"]
+    med = (d.groupby(["Plantilla", "Usuario"])["Horas de aprendizaje"].sum()
+           .groupby("Plantilla").median().rename("h_por_usuario_mediana").reset_index())
+    g = g.merge(med, on="Plantilla", how="left").merge(av, on="Plantilla", how="left")
+    return g.sort_values("horas", ascending=False).reset_index(drop=True)
+
+
+def por_centro_nivel(df_cpu: pd.DataFrame, roster: pd.DataFrame | None = None,
+                     col: str = "Centro") -> pd.DataFrame:
+    """Corte por Centro (inferido del correo) o Nivel, con media y mediana."""
+    d = df_cpu.copy()
+    d["cert"] = d["Certificado"].astype(str).str.strip().str.lower().eq("si")
+    uh = d.groupby([col, "Usuario"], as_index=False)["Horas de aprendizaje"].sum()
+    g = (uh.groupby(col, as_index=False)
+         .agg(usuarios=("Usuario", "nunique"),
+              horas=("Horas de aprendizaje", "sum"),
+              media=("Horas de aprendizaje", "mean"),
+              mediana=("Horas de aprendizaje", "median")))
+    act = (uh[uh["Horas de aprendizaje"] > 0].groupby(col)["Usuario"].nunique()
+           .rename("activados").reset_index())
+    g = g.merge(act, on=col, how="left")
+    g["activados"] = g["activados"].fillna(0).astype(int)
+    g["pct_activados"] = g["activados"] / g["usuarios"] * 100
+    med_act = (uh[uh["Horas de aprendizaje"] > 0].groupby(col)["Horas de aprendizaje"]
+               .agg(media_act="mean", mediana_act="median").reset_index())
+    g = g.merge(med_act, on=col, how="left")
+    cert = d[d["cert"]].groupby(col)["Usuario"].nunique().rename("usuarios_con_cert").reset_index()
+    g = g.merge(cert, on=col, how="left")
+    g["usuarios_con_cert"] = g["usuarios_con_cert"].fillna(0).astype(int)
+    if roster is not None and col in roster.columns:
+        lic = roster.groupby(col)["Usuario"].nunique().rename("licencias").reset_index()
+        g = g.merge(lic, on=col, how="left")
+        g["pct_licencia_inscrita"] = g["usuarios"] / g["licencias"] * 100
+        g["pct_licencia_efectiva"] = g["activados"] / g["licencias"] * 100
+    return g.sort_values("horas", ascending=False).reset_index(drop=True)
+
+
+def ruta_master(df_cpu: pd.DataFrame, nombres=None) -> dict:
+    """Ruta de Master en IA: avance por curso y cobertura por alumno."""
+    nombres = list(nombres or RUTA_MASTER)
+    objetivo = {_norm_espacios(n): n for n in nombres}
+    d = df_cpu.copy()
+    d["_n"] = d["Nombre de la LE"].map(_norm_espacios)
+    # match exacto por nombre normalizado y, si no, por prefijo (el catalogo
+    # antepone "MS - " a algunos titulos de la ruta).
+    def _match(n):
+        if n in objetivo:
+            return objetivo[n]
+        for k, v in objetivo.items():
+            if k and (n.endswith(k) or k in n):
+                return v
+        return None
+    d["curso_ruta"] = d["_n"].map(_match)
+    en_ruta = d[d["curso_ruta"].notna()].copy()
+    en_ruta["avance"] = en_ruta["Tramo porcentaje"].map(TRAMO_MAP)
+    en_ruta["cert"] = en_ruta["Certificado"].astype(str).str.strip().str.lower().eq("si")
+
+    por_curso = (en_ruta.groupby("curso_ruta", as_index=False)
+                 .agg(usuarios=("Usuario", "nunique"),
+                      horas=("Horas de aprendizaje", "sum"),
+                      certificados=("cert", "sum"),
+                      avance_medio=("avance", "mean"),
+                      avance_mediana=("avance", "median")))
+    por_curso["completado_pct"] = [
+        float((en_ruta[(en_ruta["curso_ruta"] == c)]
+               .groupby("Usuario")["avance"].max() >= 90).mean() * 100)
+        for c in por_curso["curso_ruta"]]
+    por_curso["orden"] = por_curso["curso_ruta"].map({n: i for i, n in enumerate(nombres)})
+    por_curso = por_curso.sort_values("orden").reset_index(drop=True)
+
+    avance_u = en_ruta.groupby(["Usuario", "curso_ruta"])["avance"].max().reset_index()
+    # "Tocar" un curso es CONSUMIRLO, no estar inscrito en el. La mayoria de los
+    # alumnos aparece inscrita en los 18 cursos de la ruta (asignacion masiva),
+    # asi que contar filas mide el reparto del administrador, no al alumno.
+    con_consumo = en_ruta[en_ruta["Horas de aprendizaje"] > 0]
+    cobertura = (con_consumo.groupby("Usuario")["curso_ruta"].nunique()
+                 .reindex(en_ruta["Usuario"].unique()).fillna(0).astype(int))
+    inscritos_u = en_ruta.groupby("Usuario")["curso_ruta"].nunique()
+    completos = (avance_u[avance_u["avance"] >= 90].groupby("Usuario")["curso_ruta"]
+                 .nunique().reindex(cobertura.index).fillna(0))
+    horas_u = en_ruta.groupby("Usuario")["Horas de aprendizaje"].sum()
+    return {
+        "por_curso": por_curso,
+        "n_cursos_ruta": len(nombres),
+        "n_cursos_encontrados": int(por_curso["curso_ruta"].nunique()),
+        "no_encontrados": [n for n in nombres if n not in set(por_curso["curso_ruta"])],
+        "usuarios": int(cobertura.size),
+        "cobertura_media": float(cobertura.mean()) if cobertura.size else np.nan,
+        "cobertura_mediana": float(cobertura.median()) if cobertura.size else np.nan,
+        "completos_media": float(completos.mean()) if completos.size else np.nan,
+        "completos_mediana": float(completos.median()) if completos.size else np.nan,
+        "ruta_terminada": int((completos >= len(nombres)).sum()),
+        "horas_media": float(horas_u.mean()) if horas_u.size else np.nan,
+        "horas_mediana": float(horas_u.median()) if horas_u.size else np.nan,
+        "horas_total": float(horas_u.sum()),
+        "dist_cobertura": cobertura.value_counts().sort_index(),
+        "inscritos_media": float(inscritos_u.mean()) if inscritos_u.size else np.nan,
+        "inscritos_mediana": float(inscritos_u.median()) if inscritos_u.size else np.nan,
+        "usuarios_con_consumo": int((cobertura > 0).sum()),
+        "dist_completos": completos.value_counts().sort_index(),
+        "pct_horas_plataforma": float(horas_u.sum() /
+                                      float(df_cpu["Horas de aprendizaje"].sum()) * 100)
+                                if float(df_cpu["Horas de aprendizaje"].sum()) else np.nan,
+    }
+
+
+# ==================================================================
 # BASE cacheable + orquestador con filtro de marca (para el dashboard)
 # ==================================================================
 def cargar_base(cur_path=CUR_PATH, prev_path=PREV_PATH, hist_dir=HIST_DIR) -> dict:
@@ -640,6 +1097,7 @@ def cargar_base(cur_path=CUR_PATH, prev_path=PREV_PATH, hist_dir=HIST_DIR) -> di
     marcas = [m for m in MARCAS_4 if (panel["Universidad"] == m).any()]
     return {
         "d": d,
+        "roster": cargar_roster(),
         "periodos": periodos,
         "ordenes": ordenes,
         "panel": panel,
@@ -667,6 +1125,8 @@ def computar(base: dict, marcas=None) -> dict:
 
     lift_e, base_ret = lift_estrategico(periodos, panel, ordenes, marcas)
     d_marca = {"cpu_cur": cpu_cur, "cpu_prev": cpu_prev}
+    roster = base.get("roster")
+    roster_f = _filtrar_marca(roster, marcas) if roster is not None else None
 
     return {
         "meta": base["meta"],
@@ -689,6 +1149,23 @@ def computar(base: dict, marcas=None) -> dict:
         "gateway": gateway_estrategico(periodos, panel, ordenes, base_ret, marcas),
         "base_ret": base_ret,
         "serie_larga": base["serie_larga"],
+        # ---- Bloque nuevo (sep-2026) ----
+        "dist_cur": distribucion_horas(cpu_cur),
+        "dist_prev": distribucion_horas(cpu_prev),
+        "embudo": embudo_usuarios(cpu_cur, roster, marcas),
+        "embudo_prev": embudo_usuarios(cpu_prev, roster, marcas),
+        "act_vs_efe": activos_vs_efectivos(d),
+        "cert_cur": certificacion(cpu_cur),
+        "cert_prev": certificacion(cpu_prev),
+        "cert_periodo": certificacion_por_periodo(periodos, marcas),
+        "cert_marca": certificacion_por_grupo(d["cpu_cur"], "Universidad"),
+        "catalogo": catalogo_les(cpu_cur, cpu_prev),
+        "formato": formato_plantilla(cpu_cur),
+        "centro": por_centro_nivel(cpu_cur, roster_f, "Centro"),
+        "nivel": por_centro_nivel(cpu_cur, roster_f, "Nivel"),
+        "ruta": ruta_master(cpu_cur),
+        "ruta_prev": ruta_master(cpu_prev),
+        "roster": roster_f,
     }
 
 

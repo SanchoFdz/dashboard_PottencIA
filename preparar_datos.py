@@ -35,7 +35,14 @@ OUT = pl.PREPARED_DIR
 COMPRESSION = "zstd"
 
 COLS_SLIM = ["Usuario", "ID de la LE", "Nombre de la LE", "Tramo porcentaje",
-             "Horas de aprendizaje", "Nº de contenidos consumidos", "Universidad"]
+             "Horas de aprendizaje", "Nº de contenidos consumidos", "Universidad",
+             # columnas que antes se tiraban y alimentan certificacion,
+             # catalogo, formato y centro/nivel
+             "Plantilla", "Nivel", "Certificado", "Centro", "Fecha de creación"]
+
+COLS_ROSTER = ["Usuario", "Universidad", "Centro", "Nivel",
+               "Horas de aprendizaje", "Nº de contenidos consumidos",
+               "Experiencias activas"]
 
 
 def _dump(df, path, cols=None):
@@ -72,6 +79,13 @@ def main():
         if p["label"] in cur_prev_labels:
             continue
         _dump(p["df"], os.path.join(OUT, "historico", f"snapshot_{p['orden']:02d}.parquet"), COLS_SLIM)
+
+    # roster de licencias (denominador del embudo)
+    roster = pl.cargar_roster()
+    if roster is not None:
+        _dump(roster, os.path.join(OUT, "roster.parquet"), COLS_ROSTER)
+    else:
+        print("  ! sin Listado_de_usuarios: el embudo se queda sin denominador de licencias")
 
     # serie diaria larga histórica (raw, sin prev/cur; el pipeline los re-anexa)
     hist_serie = pl._load_latest(pl.HIST_DIR, "Horas_de_aprendizaje_*.csv")

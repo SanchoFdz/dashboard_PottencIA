@@ -1,9 +1,16 @@
+# Tema de marca PottencIA. Se fija explicitamente porque Streamlit, si no,
+# sigue el modo claro/oscuro del sistema de quien abre el tablero: con tema
+# oscuro el texto en tinta violeta quedaba ilegible sobre fondo negro.
 [theme]
-primaryColor = "#1f77b4"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#eef2f7"
-textColor = "#1a1a1a"
+base = "light"
+primaryColor = "#7D17E6"                 # violeta del gradiente de marca
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F6F1FD"     # lila muy claro para tarjetas y sidebar
+textColor = "#1A0B2E"                    # violeta casi negro
 font = "sans serif"
 
 [server]
 headless = true
+
+[browser]
+gatherUsageStats = false
