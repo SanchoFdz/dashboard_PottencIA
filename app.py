@@ -5,6 +5,9 @@ Reemplaza las presentaciones fijas (Datos PottencIA - <fecha>.pptx). Se actualiz
 solo con reemplazar los CSV que Santiago descarga del proveedor Odilo BI en las
 carpetas mnt/data/current, mnt/data/previous y datos_analisis_estrategico_2026.
 
+Cada sección lleva solo título, fecha de corte, fuente y el bloque «Cómo leer
+esto» (qué muestra, cómo se calcula, definiciones). Nada interpretativo.
+
 Ejecutar:  streamlit run dashboard/app.py
 """
 
@@ -39,6 +42,9 @@ GRIS_PREV = "#D9D3E2"       # periodo anterior
 TINTA = "#1A0B2E"           # violeta casi negro, el fondo de la marca
 SEG_COLORS = {"Exploradores": "#EDE4FA", "Constantes": "#C9A7E8",
               "Intensivos": "#9B4FD1", "Power users": "#5B0FA8"}
+# Tramos de avance: misma rampa secuencial que los segmentos (orden, no juicio).
+TRAMO_COLORS = {10: "#EDE4FA", 35: "#C9A7E8", 65: "#9B4FD1", 90: "#5B0FA8"}
+TRAMO_LBL = {10: "0-20%", 35: "20-50%", 65: "50-80%", 90: "80-100%"}
 # Escala secuencial de marca para el mapa de calor de cohortes.
 ESCALA_MARCA = [[0.0, "#F6F1FD"], [0.5, "#B47BF0"], [1.0, "#5B0FA8"]]
 
@@ -93,11 +99,11 @@ st.markdown(f"""
 
 
 def color_signo(v):
-    """Verde si mejora, rojo si empeora. Unico uso legitimo de verde/rojo."""
+    """Verde si sube, rojo si baja. Unico uso legitimo de verde/rojo."""
     return VERDE if v > 0 else (ROJO if v < 0 else GRIS)
 
 
-# ---- Estilo unificado: fondo BLANCO + rejilla tenue (arregla el "fondo gris") ----
+# ---- Estilo unificado: fondo BLANCO + rejilla tenue ----
 def show(fig, height=420):
     fig.update_layout(
         template="plotly_white",
@@ -118,7 +124,7 @@ def show(fig, height=420):
 
 
 def glosario(que_es: str, como_se_calcula: str, terminos: dict | None = None):
-    """Bloque de contexto que acompaña a cada gráfica."""
+    """Bloque de contexto que acompaña a cada gráfica: dato y definición, sin lectura."""
     with st.expander("Cómo leer esto, cómo se calcula, glosario", expanded=False):
         st.markdown(f"**Qué muestra:** {que_es}")
         st.markdown(f"**Cómo se calcula:** {como_se_calcula}")
@@ -140,13 +146,6 @@ def fmt(v, dec=0):
     return f"{v:,.{dec}f}"
 
 
-def mom_pct(cur, prev):
-    """Variacion % contra el periodo anterior, tolerante a ceros."""
-    if prev in (0, None) or pd.isna(prev):
-        return float("nan")
-    return (cur - prev) / prev * 100.0
-
-
 def delta_txt(delta, sufijo="% vs periodo anterior", dec=1):
     """Texto de delta para st.metric.
 
@@ -164,7 +163,7 @@ def delta_txt(delta, sufijo="% vs periodo anterior", dec=1):
 # Carga de datos (base pesada cacheada; agregados por marca al vuelo)
 # ==================================================================
 # max_entries=1: la base es una sola y pesada; no tiene sentido guardar copias.
-@st.cache_data(show_spinner="Cargando y limpiando los CSV del proveedor…", max_entries=1)
+@st.cache_data(show_spinner="Cargando datos…", max_entries=1)
 def load_base(_token: float):
     return pl.cargar_base()
 
@@ -185,8 +184,7 @@ st.sidebar.title("PottencIA")
 st.sidebar.caption("Dashboard de monitoreo | Fuente: ODILO")
 
 # El token de recarga sigue existiendo (lo consumen los caches), pero sin boton:
-# esta vista es CEO-facing y la actualizacion de datos es tarea del equipo, no
-# del lector. Para refrescar: reiniciar la app tras reemplazar los CSV.
+# esta vista es CEO-facing. Para refrescar: reiniciar la app tras reemplazar los CSV.
 if "reload_token" not in st.session_state:
     st.session_state.reload_token = 0.0
 
@@ -199,68 +197,47 @@ except FileNotFoundError as e:
     st.stop()
 
 meta = BASE["meta"]
+CORTE = meta.get("corte", "s/d")
+EJES = ", ".join(meta.get("ejes", []))
 
+st.sidebar.markdown(f"**Fecha de corte:** {CORTE}")
 st.sidebar.markdown(f"**Periodo actual:** {meta['cur_label']}")
 st.sidebar.markdown(f"**Periodo anterior:** {meta['prev_label']}")
-st.sidebar.caption(f"Generado {meta['generado']}")
 
 # ==================================================================
-# Navegación y filtro (barra superior, no sidebar)
+# Navegación y filtro (barra superior)
 # ==================================================================
-# Con 16 secciones en una sola fila la barra se volvia ilegible, asi que la
-# navegacion es de dos niveles. Los grupos agrupan por el objeto que miden:
-# el periodo, las personas y el contenido.
-GRUPOS = {
-    "Periodo": ["Resumen", "Panorama", "Certificación", "Pulso"],
-    "Usuarios": ["Activación", "Profundidad", "Abandono", "Retención",
-                 "Crecimiento", "Tendencias", "Centro y Nivel"],
-    "Contenido": ["Cursos", "Catálogo", "Formato", "Ruta Máster", "Lift"],
-}
-SECCIONES = [s for v in GRUPOS.values() for s in v]
+# Una sola fila, en el orden del deck del comité. Activación es la única
+# sección que no viene del deck.
+SECCIONES = ["Panorama", "Pulso", "Tendencias", "Intensidad", "Crecimiento",
+             "Retención", "Abandono", "Cursos", "Puente y callejón", "Activación"]
 TITULOS = {
-    "Resumen": "Tres KPIs de cabecera",
     "Panorama": "Panorama del periodo",
-    "Certificación": "Certificados obtenidos",
-    "Pulso": "El pulso de la plataforma",
-    "Activación": "Activación: de la licencia al consumo real",
-    "Profundidad": "Profundidad de uso: cuánto consume quien consume",
-    "Abandono": "Avance y abandono en las experiencias",
-    "Retención": "Retención por cohorte",
-    "Crecimiento": "Crecimiento de la base de usuarios",
+    "Pulso": "Pulso de la plataforma",
     "Tendencias": "Tendencias diarias del periodo actual",
-    "Centro y Nivel": "Centro y nivel educativo",
-    "Cursos": "Cursos (Learning Experiences)",
-    "Catálogo": "Catálogo: uso contra fecha de creación",
-    "Formato": "Formato de curso (plantilla)",
-    "Ruta Máster": "Ruta de Máster en IA (18 cursos)",
-    "Lift": "Lift de retención por curso",
+    "Intensidad": "Intensidad y segmentación de uso",
+    "Crecimiento": "Crecimiento de la base de usuarios",
+    "Retención": "Retención por cohorte",
+    "Abandono": "Avance máximo en los cursos",
+    "Cursos": "Cursos con más y menos usuarios",
+    "Puente y callejón": "Cursos puente y callejón",
+    "Activación": "Embudo de activación",
 }
 
-if "grupo_activo" not in st.session_state:
-    st.session_state.grupo_activo = "Periodo"
-grupo = st.segmented_control("Grupo", list(GRUPOS), default=st.session_state.grupo_activo,
-                             label_visibility="collapsed", key="nav_grupo")
-if grupo is None:
-    grupo = st.session_state.grupo_activo
-st.session_state.grupo_activo = grupo
-
-seccion = st.segmented_control("Sección", GRUPOS[grupo], default=GRUPOS[grupo][0],
-                               label_visibility="collapsed", key=f"nav_{grupo}")
+if "seccion_activa" not in st.session_state:
+    st.session_state.seccion_activa = SECCIONES[0]
+seccion = st.segmented_control("Sección", SECCIONES, default=st.session_state.seccion_activa,
+                               label_visibility="collapsed", key="nav_seccion")
 if seccion is None:
-    seccion = GRUPOS[grupo][0]
+    seccion = st.session_state.seccion_activa
+st.session_state.seccion_activa = seccion
 
 TODAS = "Todas"
 
-# Secciones SIN dimension de marca: sus datos vienen de la serie diaria de
-# plataforma, que el proveedor no desglosa por universidad (ver `computar` en
-# pipeline.py: panorama, tendencias y serie_larga se calculan sobre `d`, no
-# sobre los frames filtrados). Poner el filtro aqui no cambiaba ni un numero, y
-# en Panorama era peor que inutil: los 4 KPIs seguian siendo globales pero el
-# filtro activo hacia parecer que eran de la marca elegida.
-SIN_MARCA = {
-    "Tendencias": "La serie diaria de plataforma no trae desglose por universidad.",
-    "Pulso": "La serie diaria larga no trae desglose por universidad.",
-}
+# Secciones SIN dimension de marca: salen de la serie diaria de plataforma, que
+# el proveedor no desglosa por universidad. Ahi el filtro no cambiaria ni un
+# numero, asi que no se muestra.
+SIN_MARCA = {"Tendencias", "Pulso"}
 
 # La seleccion se guarda aparte del widget: al ocultarlo en una seccion global,
 # Streamlit descarta el estado de su key y se perderia al volver.
@@ -269,19 +246,15 @@ if "marca_activa" not in st.session_state:
 
 if seccion in SIN_MARCA:
     marca_sel = TODAS
-    st.caption(f"Sin filtro por marca en esta sección. {SIN_MARCA[seccion]}")
 else:
     marca_sel = st.segmented_control(
         "Marca", [TODAS] + BASE["marcas"], default=st.session_state.marca_activa,
-        label_visibility="collapsed", key=f"marca_{seccion}",
-        help="Tendencias y pulso no lo tienen porque su fuente, la serie diaria de "
-             "plataforma, no trae desglose por universidad.")
+        label_visibility="collapsed", key=f"marca_{seccion}")
     if marca_sel is None:
         marca_sel = TODAS
     st.session_state.marca_activa = marca_sel
 
 es_global = marca_sel == TODAS
-marcas_sel = BASE["marcas"] if es_global else [marca_sel]
 marcas_key = None if es_global else (marca_sel,)
 
 R = compute(st.session_state.reload_token, marcas_key)
@@ -290,23 +263,50 @@ etiqueta_marca = "todas las marcas" if es_global else marca_sel
 st.divider()
 
 
+def encabezado(fuente: str, periodo: str | None = None):
+    """Título + una línea de metadatos: corte, periodo, fuente y marca."""
+    st.header(TITULOS[seccion])
+    periodo = periodo or (f"Periodo actual {meta['cur_label']} · "
+                          f"anterior {meta['prev_label']}")
+    marca = "global, sin desglose por marca" if seccion in SIN_MARCA else etiqueta_marca
+    st.caption(f"Corte: {CORTE} · {periodo} · Fuente: {fuente} · {marca}")
+
+
+PERIODOS_PANEL = f"Periodos del panel: {EJES}"
+
+
+def _opacidad(universidades, base=0.35):
+    """Marca elegida a opacidad plena, las demás atenuadas (nunca ocultas)."""
+    return [1.0 if (es_global or u == marca_sel) else base for u in universidades]
+
+
 # ==================================================================
-# ① PANORAMA
+# PANORAMA
 # ==================================================================
 if seccion == "Panorama":
-    st.header(TITULOS[seccion])
-
     # Los KPIs cambian de FUENTE segun el filtro, porque la serie diaria de
     # plataforma no trae desglose por universidad:
     #   - Todas  -> serie diaria de plataforma (4 KPIs, incluye efectivos).
     #   - 1 marca -> snapshot usuario x LE de esa marca (3 KPIs).
-    # Nunca se mezclan en la misma fila: los universos son distintos (la serie
-    # diaria mide ~3x las horas del snapshot). Ver la nota de medición del README.
+    # Nunca se mezclan en la misma fila: los universos son distintos.
     if es_global:
+        encabezado("serie diaria de plataforma (KPIs) y snapshot usuario×LE (por marca)")
         pan = R["panorama"]
-        st.caption(f"{meta['cur_label']} vs {meta['prev_label']} · fuente: serie diaria "
-                   f"de plataforma · todas las marcas")
+        glosario(
+            "Los 4 KPIs de cabecera del periodo, su variación contra el periodo anterior y "
+            "los mismos KPIs por universidad.",
+            "Suma de la **serie diaria de plataforma** del periodo. Δ% = (actual − anterior) / "
+            "anterior. Usuarios efectivos se divide entre 2 (corrección de doble conteo heredada "
+            "del deck). El bloque «Por marca» sale del snapshot usuario×LE.",
+            {"Horas consumidas": "suma de horas de aprendizaje del periodo.",
+             "Contenidos únicos": "recursos distintos consumidos (DISTINCT_COUNT).",
+             "Usuarios activos": "cualquier interacción registrada en el periodo.",
+             "Usuarios efectivos": "usuarios con consumo real (métrica más estricta del portal).",
+             "Serie diaria vs snapshot": "miden universos distintos (la serie diaria reporta "
+                                         "~3x las horas del snapshot); sus valores no se suman "
+                                         "ni se comparan entre sí."})
     else:
+        encabezado("snapshot usuario×LE")
         _fila = R["panorama_marca"]
         _fila = _fila[_fila["Universidad"] == marca_sel]
         pan = pd.DataFrame([
@@ -319,33 +319,23 @@ if seccion == "Panorama":
         ])
         pan["delta_pct"] = np.where(pan["anterior"] > 0,
                                     (pan["actual"] / pan["anterior"] - 1) * 100, np.nan)
-        st.caption(f"{meta['cur_label']} vs {meta['prev_label']} · fuente: snapshot "
-                   f"usuario×LE · {marca_sel}")
-
-    if es_global:
         glosario(
-            "Los 4 KPIs de cabecera del periodo y su variación contra el periodo anterior.",
-            "Suma de la **serie diaria de plataforma** del periodo. Δ% = (actual − anterior) / anterior. "
-            "Usuarios efectivos se divide entre 2 (corrección de doble conteo heredada del deck).",
-            {"Usuarios activos": "cualquier interacción registrada en el periodo.",
-             "Usuarios efectivos": "usuarios con consumo real (métrica más estricta del portal).",
-             "Contenidos únicos": "recursos distintos consumidos (DISTINCT_COUNT)."})
-    else:
-        glosario(
-            f"Los KPIs de {marca_sel} y su variación contra el periodo anterior.",
+            f"Los KPIs de {marca_sel}, su variación contra el periodo anterior y la "
+            "comparación con las demás universidades.",
             "Suma del **snapshot usuario×LE** de la marca. Δ% = (actual − anterior) / anterior. "
-            "Al filtrar por universidad la fuente cambia, porque la serie diaria de "
-            "plataforma no trae desglose por marca. Por eso estos valores no son "
-            "comparables con los de «Todas»: miden universos distintos.",
+            "Con una universidad elegida la fuente es el snapshot, porque la serie diaria de "
+            "plataforma no trae desglose por marca.",
             {"Horas consumidas": "suma de horas de la marca en el periodo.",
              "Contenidos consumidos": "suma de contenidos consumidos por la marca.",
-             "Usuarios con consumo": "usuarios distintos de la marca con al menos un registro."})
+             "Usuarios con consumo": "usuarios distintos de la marca con al menos un registro.",
+             "Valores de «Todas» vs marca": "miden universos distintos (serie diaria vs "
+                                            "snapshot); no son comparables entre sí."})
 
     cols = st.columns(len(pan))
     for col, (_, r) in zip(cols, pan.iterrows()):
         col.metric(r["kpi"], fmt(r["actual"]), delta_txt(r["delta_pct"]))
 
-    # Los cuatro KPIs tienen unidades incomparables (horas, contenidos, personas),
+    # Los KPIs tienen unidades incomparables (horas, contenidos, personas),
     # asi que se grafica la VARIACION en %, que si es comparable entre ellos.
     pv = pan.dropna(subset=["delta_pct"]).sort_values("delta_pct")
     fig = go.Figure(go.Bar(
@@ -368,15 +358,8 @@ if seccion == "Panorama":
     show(fig, height=300)
 
     st.subheader("Por marca")
-    st.caption("Un panel por métrica: dentro de cada uno las universidades comparten eje "
-               "y arrancan en cero, así que los largos de barra sí son comparables.")
     pm = R["panorama_marca"]
-
-    if not es_global:
-        st.caption(f"La comparación mantiene las cuatro marcas: **{marca_sel}** va "
-                   f"resaltada. Con una sola barra no habría nada que comparar.")
-    _op = [1.0 if (es_global or u == marca_sel) else 0.35 for u in pm["Universidad"]]
-
+    _op = _opacidad(pm["Universidad"])
     METRICAS = [("Horas", "Horas consumidas"), ("Contenidos", "Contenidos únicos"),
                 ("Usuarios", "Usuarios")]
     fig2 = make_subplots(rows=1, cols=3, subplot_titles=[lbl for _, lbl in METRICAS])
@@ -395,17 +378,60 @@ if seccion == "Panorama":
 
 
 # ==================================================================
-# ② TENDENCIAS DIARIAS
+# PULSO (serie larga)
+# ==================================================================
+elif seccion == "Pulso":
+    s = R["serie_larga"]
+    encabezado("serie diaria de horas de plataforma",
+               periodo=f"Serie {s['fecha'].min():%d-%m-%Y} a {s['fecha'].max():%d-%m-%Y}")
+    glosario(
+        "La serie diaria de horas de aprendizaje de la plataforma desde el primer día disponible.",
+        "Panel superior: media móvil de 7 días y tendencia de 28 días. Panel inferior: índice = "
+        "horas del día / tendencia 28d. Los días sin dato en las exportaciones quedan como hueco "
+        "en la línea.",
+        {"Media móvil 7d": "promedio del día y los 6 anteriores con dato.",
+         "Tendencia 28d": "media móvil centrada de 28 días.",
+         "Índice vs tendencia": "horas del día / tendencia 28d. 1 = igual a la tendencia.",
+         "Carga masiva": "alta masiva de usuarios (Feb-2026), marcada en la serie."})
+
+    # Se reindexa a calendario diario para que los dias ausentes en las
+    # exportaciones se dibujen como hueco y no como una recta que los une.
+    _cal = pd.DataFrame({"fecha": pd.date_range(s["fecha"].min(), s["fecha"].max(), freq="D")})
+    sp = _cal.merge(s, on="fecha", how="left")
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.65, 0.35],
+                        subplot_titles=["Horas de aprendizaje / día",
+                                        "Índice vs tendencia 28d"])
+    fig.add_trace(go.Scatter(x=sp["fecha"], y=sp["r7"], line=dict(color=AZUL, width=2),
+                             name="Horas/día (7d)"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=sp["fecha"], y=sp["r28"], line=dict(color=GRIS, width=1.5, dash="dash"),
+                             name="Tendencia 28d"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=sp["fecha"], y=sp["idx_estacional"], line=dict(color="#CFC3E4", width=0.5),
+                             fill="tozeroy", name="Índice", showlegend=False), row=2, col=1)
+    fig.add_hline(y=1, line=dict(color=GRIS, dash="dash"), row=2, col=1)
+    for f, txt in [("2026-02-01", "Carga masiva")]:
+        fdt = pd.to_datetime(f)
+        if s["fecha"].min() <= fdt <= s["fecha"].max():
+            fig.add_shape(type="line", x0=fdt, x1=fdt, yref="y domain", y0=0, y1=1,
+                          line=dict(color=GRIS, width=1, dash="dot"), row=1, col=1)
+            fig.add_annotation(x=fdt, yref="y domain", y=1, text=txt, textangle=-90,
+                               showarrow=False, font=dict(size=9, color=GRIS),
+                               xanchor="left", yanchor="top", row=1, col=1)
+    show(fig, height=600)
+
+
+# ==================================================================
+# TENDENCIAS DIARIAS
 # ==================================================================
 elif seccion == "Tendencias":
-    st.header(TITULOS[seccion])
-    st.caption("Fuente: serie diaria de plataforma (global, sin desglose por marca)")
+    encabezado("serie diaria de plataforma")
     glosario(
-        "El ritmo día a día del periodo actual comparado con el promedio diario del anterior.",
+        "El ritmo día a día del periodo actual y el promedio diario del periodo anterior.",
         "Línea = media móvil de 7 días de la serie diaria. Línea gris punteada = promedio "
         "diario del periodo anterior.",
-        {"Rolling 7d": "suaviza el ruido diario promediando cada día con los 6 previos.",
-         "Promedio periodo ant.": "promedio diario del periodo anterior, como referencia fija."})
+        {"Media móvil 7d": "promedio de cada día con los 6 previos.",
+         "Promedio periodo anterior": "promedio diario del periodo anterior, como referencia fija.",
+         "Media y mediana por día": "de los valores diarios del periodo actual."})
     t = R["tendencias"]
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
@@ -424,8 +450,6 @@ elif seccion == "Tendencias":
                   annotation_position="top left",
                   annotation_font=dict(size=11, color=GRIS))
     show(fig, height=560)
-    # Media y mediana del dia: si difieren mucho, el periodo trae picos que la
-    # media esconde (cargas masivas, campannas, cierres de asignatura).
     _hc = h["Horas de aprendizaje (SUM)"]
     _cc = c["cadenarecurso (DISTINCT_COUNT)"]
     c1, c2, c3, c4 = st.columns(4)
@@ -438,24 +462,29 @@ elif seccion == "Tendencias":
 
 
 # ==================================================================
-# ③ SEGMENTACIÓN
+# INTENSIDAD Y SEGMENTACIÓN
 # ==================================================================
-elif seccion == "Profundidad":
-    st.header(TITULOS[seccion])
-    st.caption(f"Fuente: snapshot usuario×LE del periodo actual · {etiqueta_marca}")
+elif seccion == "Intensidad":
+    encabezado("snapshot usuario×LE")
     glosario(
-        "Cómo se reparten los usuarios entre no activados y los 4 niveles de intensidad.",
-        "Se suman las horas por usuario en el mes y se clasifican por umbrales fijos de horas.",
-        {"No activados": "0 horas en el mes.",
-         "Exploradores": "0–1 h.", "Constantes": "1–5 h.",
-         "Intensivos": "5–20 h.", "Power users": ">20 h."})
+        "Horas por alumno activado (media, mediana y percentiles), el reparto entre no "
+        "activados y activados, y los 4 niveles de intensidad entre los activados.",
+        "Se suman las horas de cada usuario en el periodo y se clasifican por umbrales fijos. "
+        "Los cortes de distribución se calculan sobre los usuarios activados.",
+        {"No activados": "0 horas en el periodo.",
+         "Activados": "más de 0 horas en el periodo.",
+         "Exploradores": "más de 0 y hasta 1 h.", "Constantes": "más de 1 y hasta 5 h.",
+         "Intensivos": "más de 5 y hasta 20 h.", "Power users": "más de 20 h.",
+         "Mediana (p50)": "valor que deja a la mitad de los activados por debajo.",
+         "p75 / p90": "valor que deja al 75% / 90% de los activados por debajo.",
+         "Pasa de 20 min": "% de activados con 20 minutos o más en el periodo.",
+         "Concentración top 5% / 1%": "% de las horas totales que suma el 5% / 1% de usuarios "
+                                      "con más horas."})
     seg = R["segmentacion_global"]
     act, inten = seg["activacion"], seg["intensidad"]
     dc, dp = R["dist_cur"], R["dist_prev"]
 
-    # Media Y mediana, siempre juntas: con esta distribucion la media describe
-    # al top 5% (que concentra la mitad de las horas) y la mediana al alumno.
-    st.subheader("Horas por alumno: media contra mediana")
+    # Media Y mediana, siempre juntas (regla de la capa visual).
     k = st.columns(4)
     k[0].metric("Mediana del activado", f"{dc['mediana_act']*60:.0f} min",
                 delta_txt((dc["mediana_act"] - dp["mediana_act"]) * 60,
@@ -481,19 +510,12 @@ elif seccion == "Profundidad":
                        xaxis_range=[0, float(_p["min"].max()) * 1.3],
                        yaxis=dict(autorange="reversed"))
     show(figp, height=300)
-    st.caption(f"La media ({dc['media_act']*60:.0f} min) es "
-               f"{dc['media_act']/dc['mediana_act']:.1f} veces la mediana "
-               f"({dc['mediana_act']*60:.0f} min)."
-               if dc["mediana_act"] else "")
-    st.divider()
-    _noact = float(act.get("No activados", float("nan")))
 
+    _noact = float(act.get("No activados", float("nan")))
     c1, c2 = st.columns([1, 1.6])
     with c1:
         st.metric("Usuarios activados", f"{(1-_noact)*100:.1f}%")
-        st.caption(f"El {_noact*100:.1f}% restante no registró ni una hora en el periodo.")
-        # Una barra apilada lee mejor que una dona: la dona rotaba la etiqueta
-        # de "No activados" 90 grados y quedaba ilegible.
+        # Barra apilada en lugar de dona: la dona rotaba la etiqueta 90 grados.
         fig1 = go.Figure()
         fig1.add_trace(go.Bar(y=["Base"], x=[(1 - _noact) * 100], orientation="h",
                               name="Activados", marker_color=AZUL,
@@ -507,7 +529,6 @@ elif seccion == "Profundidad":
                            xaxis=dict(range=[0, 100], title="% de la base"),
                            yaxis=dict(showticklabels=False))
         show(fig1, height=170)
-
     with c2:
         fig2 = go.Figure(go.Bar(x=list(inten.values * 100), y=list(inten.index), orientation="h",
                                 marker_color=[SEG_COLORS[s] for s in inten.index],
@@ -522,24 +543,11 @@ elif seccion == "Profundidad":
     st.subheader("Por marca")
     sm = R["segmentacion_marca"]
     if not sm.empty:
-        # Dispersion entre marcas: el dato que resume las cuatro barras apiladas.
-        disp = (sm["Exploradores"].max() - sm["Exploradores"].min()) * 100
-        _alta = sm.loc[sm["Exploradores"].idxmax(), "Universidad"]
-        _baja = sm.loc[sm["Exploradores"].idxmin(), "Universidad"]
-        st.caption(f"% de exploradores: {sm['Exploradores'].max()*100:.1f}% en {_alta} y "
-                   f"{sm['Exploradores'].min()*100:.1f}% en {_baja} ({disp:.1f} puntos "
-                   f"de diferencia).")
-        if not es_global:
-            st.caption(f"La comparación mantiene las cuatro marcas: **{marca_sel}** va "
-                       f"resaltada. Con una sola barra no habría nada que comparar.")
         fig3 = go.Figure()
+        _op = _opacidad(sm["Universidad"])
         for s in pl.SEG_ORDER:
-            # Cuando hay marca elegida, las demas bajan de opacidad en vez de
-            # desaparecer: el contexto de comparacion es el valor de la grafica.
-            op = [1.0 if (es_global or u == marca_sel) else 0.35
-                  for u in sm["Universidad"]]
             fig3.add_trace(go.Bar(name=s, x=sm["Universidad"], y=sm[s] * 100,
-                                  marker=dict(color=SEG_COLORS[s], opacity=op)))
+                                  marker=dict(color=SEG_COLORS[s], opacity=_op)))
         fig3.update_layout(barmode="stack", yaxis_title="% de activados", bargap=0.45)
         show(fig3, height=300)
         with st.expander("Ver tabla (incluye % No activados)"):
@@ -547,159 +555,21 @@ elif seccion == "Profundidad":
 
 
 # ==================================================================
-# ④ ABANDONO
-# ==================================================================
-elif seccion == "Abandono":
-    st.header(TITULOS[seccion])
-    st.caption(f"Fuente: snapshot usuario×LE · {etiqueta_marca}")
-    glosario(
-        "Hasta dónde llega la gente en los cursos: se quedan al inicio o los terminan.",
-        "Para cada par (usuario, curso) se toma su **máximo tramo** de avance y se cuenta "
-        "cuántos pares caen en cada rango. Se compara la distribución del periodo actual vs. anterior.",
-        {"Par (usuario, curso)": "una inscripción concreta de una persona a un curso.",
-         "Tramo": "banda de avance reportada por el portal (0–20, 20–50, 50–80, 80–100%).",
-         "Abandono temprano": "% de pares que no pasan del 20%."})
-    ab, abp = R["abandono_cur"], R["abandono_prev"]
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Se quedan bajo 20%", f"{ab['pct_bajo20']*100:.1f}%",
-              f"{(ab['pct_bajo20']-abp['pct_bajo20'])*100:+.1f} pp vs periodo ant.",
-              delta_color="inverse")
-    c2.metric("Llegan a ≥80%", f"{ab['pct_alto80']*100:.1f}%",
-              f"{(ab['pct_alto80']-abp['pct_alto80'])*100:+.1f} pp vs periodo ant.")
-    c3.metric("Pares (usuario, curso)", fmt(len(ab["detalle"])))
-
-    tramos_lbl = {10: "0–20%", 35: "20–50%", 65: "50–80%", 90: "80–100%"}
-    dc, dp = ab["dist_tramos"], abp["dist_tramos"]
-    fig = go.Figure()
-    fig.add_trace(go.Bar(name="Actual", x=[tramos_lbl.get(i, i) for i in dc.index],
-                         y=dc.values * 100, marker_color=AZUL,
-                         text=[f"{v*100:.0f}%" for v in dc.values], textposition="outside"))
-    fig.add_trace(go.Bar(name="Anterior", x=[tramos_lbl.get(i, i) for i in dp.index],
-                         y=dp.values * 100, marker_color=GRIS_PREV))
-    fig.update_layout(barmode="group", yaxis_title="% de pares",
-                      xaxis_title="Tramo de avance máximo")
-    show(fig, height=430)
-
-
-# ==================================================================
-# ⑤ CURSOS (LEs)
-# ==================================================================
-elif seccion == "Cursos":
-    st.header(TITULOS[seccion])
-    st.caption(f"Fuente: snapshot usuario×LE · {etiqueta_marca}")
-    glosario(
-        "Qué cursos concentran las horas y cuáles suben o bajan respecto al periodo anterior.",
-        "Suma de horas por curso en el periodo actual (Top 5) y diferencia de horas vs. el "
-        "periodo anterior (Δ). Solo entran en Δ los cursos con ≥1 h el periodo anterior.",
-        {"LE": "Learning Experience = un curso/club del catálogo (~83–120 LEs).",
-         "Δ horas": "horas de este periodo menos las del periodo anterior."})
-    tl = R["top_les"]
-
-    st.subheader("Top 5 por horas consumidas (periodo actual)")
-    th = tl["top_horas"].iloc[::-1]
-    fig = go.Figure(go.Bar(x=th["horas_cur"], y=[corto(s) for s in th["Nombre de la LE"]],
-                           orientation="h",
-                           marker_color=AZUL, text=[fmt(v) for v in th["horas_cur"]],
-                           textposition="auto"))
-    fig.update_layout(xaxis_title="Horas")
-    show(fig, height=380)
-
-    c1, c2 = st.columns(2)
-    tm = tl["top_mejora"].iloc[::-1]
-    # Invertido igual que tm para que la mayor caida quede ARRIBA en los dos
-    # paneles; sin esto el orden vertical era opuesto entre subidas y caidas.
-    bc = tl["bottom_caida"].iloc[::-1]
-    figm = go.Figure(go.Bar(x=tm["delta"], y=[corto(s) for s in tm["Nombre de la LE"]],
-                            orientation="h",
-                            marker_color=VERDE, text=[f"{v:+.0f}" for v in tm["delta"]],
-                            textposition="auto"))
-    # Escala compartida entre los dos paneles: con ejes independientes una
-    # caida de 122 h y una subida de 30 h se dibujaban del mismo largo.
-    _lim = float(np.nanmax(np.abs(np.concatenate(
-        [tm["delta"].values, bc["delta"].values])))) * 1.35 if not bc.empty else None
-    figm.update_layout(title="Top 5 que más crecieron (Δ horas)",
-                       xaxis_range=[0, _lim] if _lim else None,
-                       xaxis_title="Δ horas vs periodo anterior")
-    with c1:
-        show(figm, height=360)
-    figc = go.Figure(go.Bar(x=bc["delta"], y=[corto(s) for s in bc["Nombre de la LE"]],
-                            orientation="h",
-                            marker_color=ROJO, text=[f"{v:+.0f}" for v in bc["delta"]],
-                            textposition="auto"))
-    figc.update_layout(title="Top 5 que más cayeron (Δ horas)",
-                       xaxis_range=[-_lim, 0] if _lim else None,
-                       xaxis_title="Δ horas vs periodo anterior")
-    with c2:
-        show(figc, height=360)
-
-
-# ==================================================================
-# ⑥ SERIE LARGA
-# ==================================================================
-elif seccion == "Pulso":
-    st.header(TITULOS[seccion])
-    st.caption("Serie diaria de horas (global) · rolling 7d, tendencia 28d e índice estacional")
-    _s = R["serie_larga"].dropna(subset=["r7"])
-    if len(_s) > 60:
-        _pico = _s.loc[_s["r7"].idxmax()]
-        _hoy = float(_s["r7"].iloc[-1])
-        _caida = (_hoy / float(_pico["r7"]) - 1) * 100
-        st.caption(f"Máximo de la serie: {_pico['fecha']:%d-%b-%Y} con {_pico['r7']:,.0f} h/día. "
-                   f"Último valor: {_hoy:,.0f} h/día ({_caida:+.0f}% vs el máximo).")
-    glosario(
-        "La serie diaria de horas desde Dic-2025, anotada con los eventos conocidos.",
-        "Panel superior: media móvil de 7 días (azul) y tendencia de 28 días (gris). "
-        "Panel inferior: índice = horas del día / tendencia 28d (>1 = por encima de su propia tendencia).",
-        {"Tendencia 28d": "media móvil centrada de 4 semanas; el nivel 'normal' del momento.",
-         "Índice estacional": "aísla los picos/valles de gestión de la estacionalidad del calendario.",
-         "Carga masiva": "alta masiva de usuarios (Feb-2026), anotada en la serie."})
-    s = R["serie_larga"]
-
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.65, 0.35],
-                        subplot_titles=["Horas de aprendizaje / día",
-                                        "Índice vs tendencia local (>1 = sobre su propia tendencia)"])
-    fig.add_trace(go.Scatter(x=s["fecha"], y=s["r7"], line=dict(color=AZUL, width=2),
-                             name="Horas/día (7d)"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=s["fecha"], y=s["r28"], line=dict(color=GRIS, width=1.5, dash="dash"),
-                             name="Tendencia 28d"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=s["fecha"], y=s["idx_estacional"], line=dict(color="#CFC3E4", width=0.5),
-                             fill="tozeroy", name="Índice", showlegend=False), row=2, col=1)
-    fig.add_hline(y=1, line=dict(color=GRIS, dash="dash"), row=2, col=1)
-    for f, txt in [("2026-02-01", "Carga masiva")]:
-        fdt = pd.to_datetime(f)
-        if s["fecha"].min() <= fdt <= s["fecha"].max():
-            fig.add_shape(type="line", x0=fdt, x1=fdt, yref="y domain", y0=0, y1=1,
-                          line=dict(color=ROJO, width=1, dash="dot"), row=1, col=1)
-            fig.add_annotation(x=fdt, yref="y domain", y=1, text=txt, textangle=-90,
-                               showarrow=False, font=dict(size=9, color=ROJO),
-                               xanchor="left", yanchor="top", row=1, col=1)
-    show(fig, height=600)
-
-
-# ==================================================================
-# ⑦ GROWTH ACCOUNTING
+# CRECIMIENTO (growth accounting)
 # ==================================================================
 elif seccion == "Crecimiento":
-    st.header(TITULOS[seccion])
-    st.caption(f"Composición de los usuarios activos de cada mes · {etiqueta_marca}")
-    _ga = R["growth"]
-    if len(_ga) >= 2:
-        _u = _ga.iloc[-1]
-        _pct_rec = _u["Recurrentes"] / _u["Total activos"] * 100 if _u["Total activos"] else float("nan")
-        _neto = _u["Nuevos"] + _u["Reactivados"] - _u["Perdidos"]
-        st.caption(f"{_u['eje']}: {_pct_rec:.0f}% de los activos son recurrentes · "
-                   f"{_u['Nuevos']:,.0f} nuevos · {_u['Perdidos']:,.0f} perdidos · "
-                   f"saldo neto {_neto:+,.0f}.")
+    encabezado("panel histórico de snapshots usuario×LE", periodo=PERIODOS_PANEL)
     glosario(
-        "De qué está hecha la base activa de cada mes: gente nueva, que repite, que vuelve o que se pierde.",
-        "Para cada mes se clasifica a cada usuario activo según su historial: nuevo (primera vez), "
-        "recurrente (activo el mes pasado), reactivado (activo antes pero no el mes pasado). "
-        "Perdidos = activos el mes pasado que no lo están este mes.",
-        {"Nuevos": "se activan por primera vez.",
-         "Recurrentes": "activos dos meses seguidos.",
-         "Reactivados": "vuelven tras una pausa.",
-         "Perdidos": "estaban activos y dejaron de estarlo (línea roja)."})
+        "Composición de los usuarios activos de cada periodo: nuevos, recurrentes y "
+        "reactivados, y los perdidos respecto al periodo anterior.",
+        "Cada usuario activo (más de 0 h) de un periodo se clasifica según su historial. "
+        "«Periodo anterior» es el que le precede en la lista de periodos del panel.",
+        {"Nuevos": "activos por primera vez en el panel.",
+         "Recurrentes": "activos en este periodo y en el anterior.",
+         "Reactivados": "activos en algún periodo previo, pero no en el anterior.",
+         "Perdidos": "activos en el periodo anterior y no en este (línea bajo cero).",
+         "Periodos del panel": f"{EJES}. Cada uno es un snapshot mensual o una ventana de "
+                               "export etiquetada por su punto medio."})
     ga = R["growth"]
 
     fig = go.Figure()
@@ -707,7 +577,7 @@ elif seccion == "Crecimiento":
         fig.add_trace(go.Bar(name=col, x=ga["eje"], y=ga[col], marker_color=color))
     fig.add_trace(go.Scatter(name="Perdidos", x=ga["eje"], y=-ga["Perdidos"],
                              line=dict(color=ROJO, width=2), mode="lines+markers"))
-    fig.update_layout(barmode="stack", yaxis_title="Usuarios activos")
+    fig.update_layout(barmode="stack", yaxis_title="Usuarios")
     show(fig, height=460)
 
     ga2 = ga.copy()
@@ -717,9 +587,6 @@ elif seccion == "Crecimiento":
 
     st.subheader("Por marca")
     gm = R["growth_marca"]
-    if not es_global:
-        st.caption(f"La comparación mantiene las cuatro marcas; **{marca_sel}** va marcada "
-                   f"con «▸». Los paneles de arriba sí responden al filtro.")
     _titulos = [(f"▸ {m}" if (not es_global and m == marca_sel) else m) for m in gm.keys()]
     fig2 = make_subplots(rows=2, cols=2, subplot_titles=_titulos)
     for (marca, g), (rr, cc) in zip(gm.items(), [(1, 1), (1, 2), (2, 1), (2, 2)]):
@@ -733,22 +600,18 @@ elif seccion == "Crecimiento":
 
 
 # ==================================================================
-# ⑧ COHORTES
+# RETENCIÓN (cohortes)
 # ==================================================================
 elif seccion == "Retención":
-    st.header(TITULOS[seccion])
-    st.caption(f"% de cada cohorte que sigue activo N periodos después · {etiqueta_marca}")
-    _coh = R["cohortes"]
-    if "m1" in _coh.columns and _coh["m1"].notna().any():
-        _m1 = _coh["m1"].dropna()
-        st.caption(f"Retorno en +1 periodo: media {_m1.mean()*100:.0f}% de la cohorte, "
-                   f"mínimo {_m1.min()*100:.0f}%, máximo {_m1.max()*100:.0f}%.")
+    encabezado("panel histórico de snapshots usuario×LE", periodo=PERIODOS_PANEL)
     glosario(
-        "Cuánto aguanta cada 'generación' de usuarios según el mes en que se activó por primera vez.",
-        "Se agrupa a los usuarios por su mes de primera actividad (cohorte) y se mide qué "
-        "porcentaje sigue activo 1, 2, 3… periodos después. m0 siempre es 100%.",
-        {"Cohorte": "todos los que se activaron por primera vez el mismo mes.",
-         "+N": "N periodos después de la primera actividad."})
+        "% de cada cohorte que sigue activa N periodos después de su primera actividad.",
+        "Se agrupa a los usuarios por su periodo de primera actividad (cohorte) y se mide qué "
+        "porcentaje tiene más de 0 h 1, 2, 3… periodos después. +0 siempre es 100%.",
+        {"Cohorte": "usuarios cuya primera actividad cae en el mismo periodo.",
+         "n": "tamaño de la cohorte (usuarios).",
+         "+N": "N periodos después de la primera actividad, contados sobre la lista del panel.",
+         "Periodos del panel": f"{EJES}."})
     coh = R["cohortes"]
     mcols = [c for c in coh.columns if c.startswith("m")]
 
@@ -759,13 +622,11 @@ elif seccion == "Retención":
         colorscale=ESCALA_MARCA, zmin=0, zmax=float(np.nanmax(z[:, 1:])) if z.shape[1] > 1 else 100,
         text=[[f"{v:.0f}" if not np.isnan(v) else "" for v in row] for row in z],
         texttemplate="%{text}", colorbar=dict(title="%")))
-    fig.update_layout(yaxis=dict(autorange="reversed"),
+    fig.update_layout(title="% de la cohorte activo", yaxis=dict(autorange="reversed"),
                       xaxis_title="Periodos desde la primera actividad")
     show(fig, height=430)
 
     figc = go.Figure()
-    # Azules de claro (cohorte vieja) a oscuro (reciente): la secuencia se lee
-    # como orden temporal, algo que los colores por defecto no comunican.
     _tot = max(len(coh), 2)
     for i, r in enumerate(coh.itertuples()):
         ys = [getattr(r, c) * 100 if not pd.isna(getattr(r, c)) else None for c in mcols]
@@ -775,541 +636,273 @@ elif seccion == "Retención":
         figc.add_trace(go.Scatter(x=list(range(len(mcols))), y=ys, mode="lines+markers",
                                   line=dict(color=_col, width=2),
                                   marker=dict(color=_col, size=6), name=r.Cohorte))
-    figc.update_layout(title="Curvas de vida", yaxis_title="% de la cohorte activo",
+    figc.update_layout(title="Curvas de retención", yaxis_title="% de la cohorte activo",
                        xaxis_title="Periodos desde la primera actividad")
     show(figc, height=420)
 
 
 # ==================================================================
-# ⑨ LIFT DE RETENCIÓN (métrica del análisis estratégico)
+# ABANDONO (avance máximo)
 # ==================================================================
-elif seccion == "Lift":
-    st.header(TITULOS[seccion])
-    st.caption(f"Métrica del análisis estratégico (observada vs. esperada) · {etiqueta_marca}")
+elif seccion == "Abandono":
+    encabezado("snapshot usuario×LE")
     glosario(
-        "Retención de cada curso contra la base global: por encima (gancho) o por debajo (callejón).",
-        "Para cada curso: **retención observada** = % de sus consumidores de un mes que siguen "
-        "activos (en cualquier curso) el mes siguiente, agrupando todos los meses. "
-        "**Retención esperada** = tasa base global de retorno de la plataforma. "
-        "**Lift (pp)** = observada − esperada. Solo cursos con ≥100 transiciones-usuario.",
-        {"Lift (pp)": "puntos porcentuales por encima/debajo de la base. +10 pp = retiene 10 puntos más que el promedio.",
-         "Base esperada": f"tasa global de retorno mes→mes ({R['base_ret']:.1f}% en esta selección).",
-         "Gancho": "lift positivo: sus consumidores vuelven por encima de la base.",
-         "Callejón": "lift negativo: sus consumidores vuelven por debajo de la base.",
-         "Gateway": "curso con el que ARRANCAN los usuarios nuevos, y cuánto retiene."})
+        "Reparto de los pares (usuario, curso) según el avance máximo alcanzado, periodo "
+        "actual contra anterior y por universidad.",
+        "Para cada par (usuario, curso) se toma su **máximo tramo** de avance y se cuenta "
+        "cuántos pares caen en cada tramo.",
+        {"Par (usuario, curso)": "una inscripción concreta de una persona a un curso.",
+         "Tramo": "banda de avance reportada por el portal (0-20, 20-50, 50-80, 80-100%).",
+         "Bajo 20%": "% de pares cuyo avance máximo está en el tramo 0-20%.",
+         "80% o más": "% de pares cuyo avance máximo está en el tramo 80-100%."})
+    ab, abp = R["abandono_cur"], R["abandono_prev"]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pares bajo 20%", f"{ab['pct_bajo20']*100:.1f}%",
+              delta_txt((ab["pct_bajo20"] - abp["pct_bajo20"]) * 100, sufijo=" pp vs periodo ant."),
+              delta_color="inverse")
+    c2.metric("Pares en 80% o más", f"{ab['pct_alto80']*100:.1f}%",
+              delta_txt((ab["pct_alto80"] - abp["pct_alto80"]) * 100, sufijo=" pp vs periodo ant."))
+    c3.metric("Pares (usuario, curso)", fmt(len(ab["detalle"])))
+
+    dc, dp = ab["dist_tramos"], abp["dist_tramos"]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name="Anterior", x=[TRAMO_LBL.get(i, i) for i in dp.index],
+                         y=dp.values * 100, marker_color=GRIS_PREV,
+                         text=[f"{v*100:.0f}%" for v in dp.values], textposition="outside"))
+    fig.add_trace(go.Bar(name="Actual", x=[TRAMO_LBL.get(i, i) for i in dc.index],
+                         y=dc.values * 100, marker_color=AZUL,
+                         text=[f"{v*100:.0f}%" for v in dc.values], textposition="outside"))
+    fig.update_layout(barmode="group", yaxis_title="% de pares",
+                      xaxis_title="Tramo de avance máximo")
+    show(fig, height=430)
+
+    st.subheader("Por marca (periodo actual)")
+    am = R["abandono_marca"]
+    if not am.empty:
+        fig2 = go.Figure()
+        _op = _opacidad(am["Universidad"])
+        for t in (10, 35, 65, 90):
+            fig2.add_trace(go.Bar(name=TRAMO_LBL[t], x=am["Universidad"], y=am[t] * 100,
+                                  marker=dict(color=TRAMO_COLORS[t], opacity=_op),
+                                  # Sin etiqueta en segmentos < 5%: no caben y se enciman.
+                                  text=[f"{v*100:.0f}%" if v >= 0.05 else "" for v in am[t]],
+                                  textposition="inside",
+                                  hovertemplate="%{x}<br>" + TRAMO_LBL[t] +
+                                                ": %{y:.1f}% de pares<extra></extra>"))
+        fig2.update_layout(barmode="stack", yaxis_title="% de pares", yaxis_range=[0, 100],
+                           bargap=0.45, legend_title_text="Tramo")
+        show(fig2, height=340)
+        with st.expander("Ver tabla"):
+            _t = am.rename(columns={t: TRAMO_LBL[t] for t in TRAMO_LBL})
+            for c in TRAMO_LBL.values():
+                _t[c] = (_t[c] * 100).round(1)
+            st.dataframe(_t, use_container_width=True, hide_index=True)
+
+
+# ==================================================================
+# CURSOS: más y menos usuarios, y variación de horas
+# ==================================================================
+elif seccion == "Cursos":
+    encabezado("snapshot usuario×LE")
+    glosario(
+        "Cursos ordenados por número de usuarios con consumo en el periodo actual, y cursos "
+        "con mayor subida y bajada de horas contra el periodo anterior.",
+        "Usuarios = usuarios distintos con más de 0 h en el curso durante el periodo. Solo entran "
+        "cursos con al menos 1 usuario con consumo en el periodo actual; los empates se ordenan "
+        "por ID del curso. Δ horas = horas del periodo actual menos horas del anterior, solo "
+        "cursos con 1 h o más en el periodo anterior.",
+        {"Curso (LE)": "Learning Experience, un curso o club del catálogo.",
+         "Usuarios con consumo": "usuarios distintos con más de 0 h en ese curso.",
+         "Δ usuarios": "usuarios del periodo actual menos los del anterior.",
+         "Δ horas": "horas del periodo actual menos las del anterior."})
+    ul = R["top_les"]["usuarios"]
+    if ul.empty:
+        st.info("Sin cursos con consumo en esta selección.")
+    else:
+        _c_sel, _ = st.columns([1, 3])
+        with _c_sel:
+            n = st.selectbox("Cursos por lado", [5, 10, 15], index=1, key="n_cursos")
+        k = st.columns(3)
+        k[0].metric("Cursos con consumo", fmt(len(ul)))
+        k[1].metric("Mediana de usuarios por curso", fmt(ul["usuarios_cur"].median()))
+        k[2].metric("Cursos con 1 usuario", fmt((ul["usuarios_cur"] == 1).sum()))
+
+        top = ul.head(n).iloc[::-1]
+        bot = ul.tail(n).iloc[::-1]
+        # Escala compartida entre los dos paneles (regla de la capa visual).
+        lim = float(ul["usuarios_cur"].max()) * 1.25
+
+        def _barras(df, titulo):
+            f = go.Figure(go.Bar(
+                x=df["usuarios_cur"], y=[corto(s) for s in df["Nombre de la LE"]],
+                orientation="h", marker_color=AZUL,
+                text=[fmt(v) for v in df["usuarios_cur"]], textposition="outside",
+                customdata=list(zip(df["Nombre de la LE"], df["usuarios_prev"], df["horas_cur"])),
+                hovertemplate="%{customdata[0]}<br>%{x:,.0f} usuarios<br>"
+                              "Periodo anterior %{customdata[1]:,.0f}<br>"
+                              "%{customdata[2]:,.1f} h<extra></extra>"))
+            f.update_layout(title=titulo, xaxis_title="Usuarios con consumo",
+                            xaxis_range=[0, lim])
+            return f
+
+        c1, c2 = st.columns(2)
+        with c1:
+            show(_barras(top, f"{n} cursos con más usuarios"), height=120 + 32 * n)
+        with c2:
+            show(_barras(bot, f"{n} cursos con menos usuarios"), height=120 + 32 * n)
+
+        st.subheader("Variación de horas contra el periodo anterior")
+        tl = R["top_les"]
+        tm = tl["top_mejora"].iloc[::-1]
+        # Invertido igual que tm para que la mayor caida quede ARRIBA en los dos paneles.
+        bc = tl["bottom_caida"].iloc[::-1]
+        # Escala compartida entre los dos paneles.
+        _lim = float(np.nanmax(np.abs(np.concatenate(
+            [tm["delta"].values, bc["delta"].values])))) * 1.35 if not bc.empty else None
+        figm = go.Figure(go.Bar(x=tm["delta"], y=[corto(s) for s in tm["Nombre de la LE"]],
+                                orientation="h", marker_color=VERDE,
+                                text=[f"{v:+.0f}" for v in tm["delta"]], textposition="outside",
+                                customdata=tm["Nombre de la LE"],
+                                hovertemplate="%{customdata}<br>%{x:+,.1f} h<extra></extra>"))
+        figm.update_layout(title="5 con mayor subida (Δ horas)",
+                           xaxis_range=[0, _lim] if _lim else None,
+                           xaxis_title="Δ horas vs periodo anterior")
+        figc = go.Figure(go.Bar(x=bc["delta"], y=[corto(s) for s in bc["Nombre de la LE"]],
+                                orientation="h", marker_color=ROJO,
+                                text=[f"{v:+.0f}" for v in bc["delta"]], textposition="outside",
+                                customdata=bc["Nombre de la LE"],
+                                hovertemplate="%{customdata}<br>%{x:+,.1f} h<extra></extra>"))
+        figc.update_layout(title="5 con mayor bajada (Δ horas)",
+                           xaxis_range=[-_lim, 0] if _lim else None,
+                           xaxis_title="Δ horas vs periodo anterior")
+        c1, c2 = st.columns(2)
+        with c1:
+            show(figm, height=360)
+        with c2:
+            show(figc, height=360)
+
+        with st.expander("Ver todos los cursos"):
+            st.dataframe(
+                ul[["Nombre de la LE", "usuarios_cur", "usuarios_prev", "delta_usuarios",
+                    "horas_cur", "horas_prev"]]
+                .rename(columns={"usuarios_cur": "Usuarios (actual)",
+                                 "usuarios_prev": "Usuarios (anterior)",
+                                 "delta_usuarios": "Δ usuarios",
+                                 "horas_cur": "Horas (actual)", "horas_prev": "Horas (anterior)"})
+                .round(1),
+                use_container_width=True, hide_index=True)
+
+
+# ==================================================================
+# PUENTE Y CALLEJÓN (lift de retención por curso)
+# ==================================================================
+elif seccion == "Puente y callejón":
+    encabezado("panel histórico de snapshots usuario×LE", periodo=PERIODOS_PANEL)
+    glosario(
+        "Retención de los consumidores de cada curso contra la retención base de la plataforma.",
+        "Para cada curso: **retención observada** = % de sus consumidores de un periodo que "
+        "tienen más de 0 h (en cualquier curso) el periodo siguiente, agrupando todas las "
+        "transiciones del panel. **Retención esperada** = tasa base de retorno de la plataforma "
+        "en la misma selección. **Lift (pp)** = observada − esperada. Solo cursos con 100 "
+        "transiciones-usuario o más.",
+        {"Lift (pp)": "puntos porcentuales por encima (+) o por debajo (−) de la base.",
+         "Base esperada": f"tasa de retorno periodo a periodo de la plataforma "
+                          f"({R['base_ret']:.1f}% en esta selección).",
+         "Curso puente": "lift positivo: sus consumidores vuelven por encima de la base.",
+         "Curso callejón": "lift negativo: sus consumidores vuelven por debajo de la base.",
+         "Transición-usuario": "un usuario con consumo en el curso en un periodo, observado "
+                               "en el periodo siguiente.",
+         "Periodos del panel": f"{EJES}."})
 
     lift = R["lift_estrategico"]
     if lift.empty:
-        st.info("No hay suficientes datos (≥100 transiciones por curso) en esta selección.")
+        st.info("No hay cursos con 100 transiciones o más en esta selección.")
     else:
-        st.metric("Base esperada de retorno (esta selección)", f"{R['base_ret']:.1f}%")
-        _c_sel, _ = st.columns([1, 2])
-        with _c_sel:
-            n = st.selectbox("Cursos por lado", [5, 8, 10, 15], index=1)
-        top_g = lift.head(n).iloc[::-1]
-        top_c = lift.tail(n)
+        c_m, c_sel, _ = st.columns([1, 1, 2])
+        c_m.metric("Base esperada de retorno", f"{R['base_ret']:.1f}%")
+        with c_sel:
+            n = st.selectbox("Cursos por lado", [5, 8, 10, 15], index=1, key="n_lift")
+        top_g = lift[lift["lift_pp"] > 0].head(n).iloc[::-1]
+        top_c = lift[lift["lift_pp"] < 0].tail(n)
+        # Ambos paneles comparten escala: si no, barras del mismo largo
+        # representan magnitudes distintas.
+        lim = float(np.nanmax(np.abs(np.concatenate(
+            [top_g["lift_pp"].values, top_c["lift_pp"].values, [1.0]])))) * 1.35
+
+        def _hover(df):
+            return list(zip(df["retencion_obs_pct"], df["n_usuario_transiciones"],
+                            df["Nombre de la LE"]))
+
+        _ht = ("%{customdata[2]}<br>Lift %{x:+.1f} pp<br>Retención observada "
+               "%{customdata[0]:.0f}%<br>Transiciones n=%{customdata[1]:,.0f}<extra></extra>")
         c1, c2 = st.columns(2)
         figg = go.Figure(go.Bar(
             x=top_g["lift_pp"], y=[corto(s) for s in top_g["Nombre de la LE"]],
             orientation="h", marker_color=VERDE,
             text=[f"{v:+.1f} pp" for v in top_g["lift_pp"]], textposition="outside",
-            customdata=list(zip(top_g["retencion_obs_pct"], top_g["n_usuario_transiciones"],
-                                top_g["Nombre de la LE"])),
-            hovertemplate="%{customdata[2]}<br>Lift %{x:+.1f} pp<br>"
-                          "Retencion observada %{customdata[0]:.0f}%<br>"
-                          "Transiciones n=%{customdata[1]:,.0f}<extra></extra>"))
-        # Ambos paneles comparten escala: si no, barras del mismo largo
-        # representan magnitudes distintas y la comparacion visual enganna.
-        lim = float(np.nanmax(np.abs(np.concatenate(
-            [top_g["lift_pp"].values, top_c["lift_pp"].values])))) * 1.35
-        figg.update_layout(title="Gancho: retienen por encima de la base",
-                           xaxis_title="Lift (pp)", xaxis_range=[0, lim])
+            customdata=_hover(top_g), hovertemplate=_ht))
+        figg.update_layout(title="Puente: lift positivo", xaxis_title="Lift (pp)",
+                           xaxis_range=[0, lim])
         with c1:
             show(figg, height=460)
         figc = go.Figure(go.Bar(
             x=top_c["lift_pp"], y=[corto(s) for s in top_c["Nombre de la LE"]],
             orientation="h", marker_color=ROJO,
-            text=[f"{v:+.1f} pp" for v in top_c["lift_pp"]], textposition="inside",
-            insidetextfont=dict(color="white"), textangle=0,
-            customdata=list(zip(top_c["retencion_obs_pct"], top_c["n_usuario_transiciones"],
-                                top_c["Nombre de la LE"])),
-            hovertemplate="%{customdata[2]}<br>Lift %{x:+.1f} pp<br>"
-                          "Retencion observada %{customdata[0]:.0f}%<br>"
-                          "Transiciones n=%{customdata[1]:,.0f}<extra></extra>"))
-        figc.update_layout(title="Callejón: por debajo de la base",
-                           xaxis_title="Lift (pp)", xaxis_range=[-lim, 0])
+            text=[f"{v:+.1f} pp" for v in top_c["lift_pp"]], textposition="outside",
+            customdata=_hover(top_c), hovertemplate=_ht))
+        figc.update_layout(title="Callejón: lift negativo", xaxis_title="Lift (pp)",
+                           xaxis_range=[-lim, 0])
         with c2:
             show(figc, height=460)
 
         with st.expander("Ver ranking completo"):
-            st.dataframe(lift, use_container_width=True, hide_index=True)
-
-        # ---- Gateway de usuarios nuevos ----
-        st.subheader("Puerta de entrada (gateway de usuarios nuevos)")
-        st.caption("Con qué curso arrancan los usuarios NUEVOS y su lift de retención.")
-        gw = R["gateway"]
-        if not gw.empty:
-            gtop = gw.head(n).iloc[::-1]
-            figw = go.Figure(go.Bar(
-                x=gtop["lift_pp"], y=[corto(s) for s in gtop["Nombre de la LE"]],
-                orientation="h", marker_color=AZUL,
-                text=[f"{v:+.1f} pp" for v in gtop["lift_pp"]], textposition="outside",
-                customdata=list(zip(gtop["retencion_obs_pct"], gtop["n"],
-                                    gtop["Nombre de la LE"])),
-                hovertemplate="%{customdata[2]}<br>Lift %{x:+.1f} pp<br>"
-                              "Retencion observada %{customdata[0]:.0f}%<br>"
-                              "Usuarios nuevos n=%{customdata[1]:,.0f}<extra></extra>"))
-            figw.update_layout(title="Mejores puertas de entrada (por lift)", xaxis_title="Lift (pp)")
-            show(figw, height=440)
-            with st.expander("Ver tabla de gateways"):
-                st.dataframe(gw, use_container_width=True, hide_index=True)
-
-    with st.expander("¿En qué se diferencia del lift del deck (s2d)?"):
-        st.markdown(
-            "El deck usaba una base **por mes** y promediaba los lifts. Esta versión "
-            "(la del análisis estratégico) usa una **base global única** y agrupa todas las "
-            "transiciones. Aquí tienes ambas para referencia:")
-        if not R["lift_deck"].empty:
-            st.dataframe(R["lift_deck"].round(2), use_container_width=True, hide_index=True)
-# ==================================================================
-# RESUMEN (portada): los tres KPIs que el comite quiere mover
-# ==================================================================
-elif seccion == "Resumen":
-    st.header(TITULOS[seccion])
-    st.caption(f"{meta['cur_label']} vs {meta['prev_label']} · {etiqueta_marca}")
-
-    dc, dp = R["dist_cur"], R["dist_prev"]
-    emb, embp = R["embudo"], R["embudo_prev"]
-
-    def _etapa(df, nombre):
-        f = df[df["etapa"] == nombre]
-        return int(f["usuarios"].iloc[0]) if len(f) else None
-
-    lic = _etapa(emb, "Usuarios con licencia")
-    efe_cur = _etapa(emb, "Efectivos: consumo > 0 h")
-    efe_prev = _etapa(embp, "Efectivos: consumo > 0 h")
-    act_cur = (efe_cur / lic * 100) if lic else np.nan
-    act_prev = (efe_prev / lic * 100) if lic else np.nan
-
-    # Retencion: la cohorte mas antigua en su ultimo periodo observado. Es la
-    # misma lectura que llevo el comite ("12% de los de enero siguen en agosto").
-    coh = R["cohortes"]
-    _mc = [c for c in coh.columns if c.startswith("m")]
-    ret_pct = ret_n = ret_lbl = None
-    if len(coh) and _mc:
-        fila = coh.iloc[0]
-        vivos = [c for c in _mc if pd.notna(fila.get(c))]
-        if vivos:
-            ult = vivos[-1]
-            ret_pct = float(fila[ult]) * 100
-            ret_n = int(round(float(fila[ult]) * float(fila["n"])))
-            ret_lbl = f"cohorte {fila['Cohorte']} en +{ult[1:]}"
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("① Activación efectiva",
-              f"{act_cur:.1f}%" if pd.notna(act_cur) else "s/d",
-              delta_txt(act_cur - act_prev, sufijo=" pp vs periodo anterior")
-              if pd.notna(act_cur) and pd.notna(act_prev) else None)
-    c1.caption(f"{fmt(efe_cur)} usuarios con consumo > 0 h sobre {fmt(lic)} con licencia."
-               if lic else "Sin roster de licencias.")
-    c2.metric("② Tiempo de consumo (mediana)", f"{dc['mediana_act']*60:.0f} min",
-              delta_txt((dc["mediana_act"] - dp["mediana_act"]) * 60,
-                        sufijo=" min vs periodo anterior", dec=0))
-    c2.caption(f"Media {dc['media_act']*60:.0f} min ({dc['media_act']/dc['mediana_act']:.1f}x "
-               f"la mediana)." if dc["mediana_act"] else "")
-    c3.metric("③ Retención", f"{ret_pct:.1f}%" if ret_pct is not None else "s/d")
-    c3.caption(f"{fmt(ret_n)} de {fmt(float(coh.iloc[0]['n']))} alumnos ({ret_lbl})."
-               if ret_pct is not None else "")
-
-    glosario(
-        "Los tres KPIs de cabecera, calculados con la data que ya existe.",
-        "**① Activación** = usuarios con consumo > 0 h en el periodo / usuarios con licencia "
-        "(roster acumulado). **② Tiempo de consumo** = mediana de horas por usuario activado, "
-        "en minutos (se muestra también la media). "
-        "**③ Retención** = % de la cohorte más antigua que sigue activa en su último periodo observado.",
-        {"Denominador de activación": "usuarios con licencia del roster. La cifra de logins "
-                                      "históricos que maneja el comité no viene en estas "
-                                      "exportaciones.",
-         "Media y mediana": "el top 5% de usuarios concentra el "
-                            f"{dc['share_top5']:.0f}% de las horas, así que media y mediana "
-                            "difieren mucho.",
-         "Sin umbrales": "las tres tarjetas no llevan semáforo: no hay metas definidas en la data."})
-
-    st.subheader("Dónde se detalla cada KPI")
-    st.caption("Secciones del dashboard donde aparece el desglose de cada KPI.")
-    st.dataframe(pd.DataFrame([
-        {"KPI": "① Activación", "Hoy": f"{act_cur:.1f}%" if pd.notna(act_cur) else "s/d",
-         "Secciones": "Activación, Centro y Nivel, Catálogo, Formato"},
-        {"KPI": "② Tiempo de consumo", "Hoy": f"{dc['mediana_act']*60:.0f} min (mediana)",
-         "Secciones": "Profundidad, Abandono, Formato, Ruta Máster, Cursos"},
-        {"KPI": "③ Retención", "Hoy": f"{ret_pct:.1f}%" if ret_pct is not None else "s/d",
-         "Secciones": "Retención, Crecimiento, Lift, Ruta Máster"},
-    ]), use_container_width=True, hide_index=True)
+            st.dataframe(lift.drop(columns=["ID de la LE"]), use_container_width=True,
+                         hide_index=True)
 
 
 # ==================================================================
-# ACTIVACIÓN: embudo de usuarios únicos + activos vs efectivos
+# ACTIVACIÓN: embudo de usuarios únicos
 # ==================================================================
 elif seccion == "Activación":
-    st.header(TITULOS[seccion])
-    st.caption(f"Usuarios únicos · roster de licencias + snapshot usuario×LE · {etiqueta_marca}")
+    encabezado("roster de licencias + snapshot usuario×LE")
     emb, embp = R["embudo"], R["embudo_prev"]
     glosario(
-        "Cuánta gente hay en cada escalón, de tener licencia a consumir de verdad.",
+        "Usuarios únicos en cada escalón, desde tener licencia hasta acumular 5 h de consumo, "
+        "y el mismo embudo en el periodo anterior.",
         "Todos los escalones son **usuarios únicos**. El primero sale del roster "
         "(`Listado_de_usuarios`, acumulado de vida); los demás del snapshot usuario×LE del "
-        "periodo, sumando horas por usuario y contando cuántos superan cada umbral.",
+        "periodo, sumando horas por usuario y contando cuántos alcanzan cada umbral. "
+        "% de la base = usuarios del escalón / usuarios con licencia.",
         {"Licencia": "usuario que aparece en el roster del proveedor, tenga o no actividad.",
          "Inscrito": "tiene al menos una fila usuario×LE en el periodo, aunque con 0 h.",
          "Efectivo": "acumula más de 0 h en el periodo.",
-         "20 min": "umbral que el comité usa para hablar de tiempo de consumo (1/3 de hora).",
-         "Activo (serie diaria)": "definición del portal: entró a la plataforma. No es una "
-                                  "persona única, es un conteo por día (ver panel de abajo)."})
+         "20 min / 1 h / 5 h": "acumula al menos ese tiempo en el periodo, sumando todos "
+                               "sus cursos.",
+         "Roster": "mismo denominador en los dos periodos (acumulado de vida)."})
 
     fig = go.Figure(go.Bar(
         x=emb["usuarios"], y=emb["etapa"], orientation="h", marker_color=AZUL,
         text=[f"{u:,.0f}  ({p:.1f}% de la base)" for u, p in zip(emb["usuarios"], emb["pct_base"])],
         textposition="outside",
         customdata=list(zip(emb["pct_paso"], emb["fuente"])),
-        hovertemplate="%{y}<br>%{x:,.0f} usuarios<br>Pasa del escalón anterior: "
+        hovertemplate="%{y}<br>%{x:,.0f} usuarios<br>% del escalón anterior: "
                       "%{customdata[0]:.1f}%<br>Fuente: %{customdata[1]}<extra></extra>"))
-    fig.update_layout(title="Embudo de usuarios únicos del periodo",
+    fig.update_layout(title="Usuarios únicos por escalón, periodo actual",
                       xaxis_title="Usuarios", xaxis_range=[0, float(emb["usuarios"].max()) * 1.35],
                       yaxis=dict(autorange="reversed"))
     show(fig, height=420)
 
-    st.subheader("Contra el periodo anterior")
-    st.caption("Mismo escalón, misma escala: el roster es el mismo en los dos periodos.")
     _m = embp.set_index("etapa")["usuarios"]
     fig2 = go.Figure()
     fig2.add_trace(go.Bar(name="Anterior", x=emb["etapa"], y=[_m.get(e, np.nan) for e in emb["etapa"]],
                           marker_color=GRIS_PREV))
     fig2.add_trace(go.Bar(name="Actual", x=emb["etapa"], y=emb["usuarios"], marker_color=AZUL))
-    fig2.update_layout(barmode="group", yaxis_title="Usuarios únicos", bargap=0.3)
+    fig2.update_layout(barmode="group", title="Periodo actual contra anterior",
+                       yaxis_title="Usuarios únicos", bargap=0.3)
     fig2.update_yaxes(rangemode="tozero")
     show(fig2, height=380)
-
-    st.subheader("Activos vs efectivos (definición del portal)")
-    ae = R["act_vs_efe"]["cur"]
-    st.caption(f"Activo = entró a la plataforma. Efectivo = tuvo alguna actividad. "
-               f"Son conteos por día sumados sobre {ae['dias']} días (usuario-día), "
-               f"no personas distintas, así que no entran en el embudo de arriba.")
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Activos por día (media)", fmt(ae["activos_dia_media"]),
-              f"mediana {ae['activos_dia_mediana']:,.0f}", delta_color="off")
-    k2.metric("Efectivos por día (media)", fmt(ae["efectivos_dia_media"]),
-              f"mediana {ae['efectivos_dia_mediana']:,.0f}", delta_color="off")
-    k3.metric("Efectivos / activos", f"{ae['ratio']:.1f}%")
-    st.caption("El ratio se calcula sobre los valores crudos del portal: la corrección ÷2 que el "
-               "deck aplica a los efectivos solo entra en el KPI de panorama.")
-
-
-# ==================================================================
-# CERTIFICACIÓN (resultado)
-# ==================================================================
-elif seccion == "Certificación":
-    st.header(TITULOS[seccion])
-    st.caption(f"Fuente: snapshot usuario×LE, columna Certificado · {etiqueta_marca}")
-    cc, cp = R["cert_cur"], R["cert_prev"]
-    st.caption(f"Certifican el {cc['tasa_cert_entre_fin']:.0f}% de los pares que llegan al "
-               f"tramo 80-100%.")
-    glosario(
-        "Cuántos certificados se obtuvieron y qué parte de la base los consigue.",
-        "`Certificado` es una columna del par (usuario, LE): dice si **ese alumno** obtuvo el "
-        "certificado en **ese curso**. Se cuentan pares con `Si`, alumnos distintos con al menos "
-        "uno, y la tasa entre los pares que llegan al tramo 80-100%.",
-        {"Atributo del par, no del curso": "99 de 112 LEs tienen filas Si y No a la vez.",
-         "Tasa por usuario": "alumnos con al menos un certificado / alumnos inscritos en el periodo.",
-         "Certificados sin avance": f"{fmt(cc['incoherentes'])} pares traen certificado con avance "
-                                    "declarado bajo 20%."})
-    k = st.columns(4)
-    k[0].metric("Certificados obtenidos", fmt(cc["certificados"]),
-                delta_txt(mom_pct(cc["certificados"], cp["certificados"])))
-    k[1].metric("Alumnos con certificado", fmt(cc["usuarios_con_cert"]),
-                delta_txt(mom_pct(cc["usuarios_con_cert"], cp["usuarios_con_cert"])))
-    k[2].metric("Tasa por alumno", f"{cc['tasa_usuario']:.1f}%",
-                delta_txt(cc["tasa_usuario"] - cp["tasa_usuario"], sufijo=" pp vs periodo anterior"))
-    k[3].metric("Certificados por alumno certificado",
-                f"{cc['cert_por_usuario_media']:.1f}",
-                f"mediana {cc['cert_por_usuario_mediana']:.0f}", delta_color="off")
-
-    cpp = R["cert_periodo"]
-    if not cpp.empty:
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        fig.add_trace(go.Bar(x=cpp["eje"], y=cpp["Certificados"], name="Certificados",
-                             marker_color=AZUL), secondary_y=False)
-        fig.add_trace(go.Scatter(x=cpp["eje"], y=cpp["Tasa por usuario (%)"], name="Tasa por alumno",
-                                 mode="lines+markers", line=dict(color=GRIS, width=2)),
-                      secondary_y=True)
-        fig.update_yaxes(title_text="Certificados", rangemode="tozero", secondary_y=False)
-        fig.update_yaxes(title_text="% de alumnos con certificado", rangemode="tozero",
-                         secondary_y=True, showgrid=False)
-        fig.update_layout(title="Certificados por periodo y tasa por alumno")
-        show(fig, height=420)
-        with st.expander("Ver tabla por periodo"):
-            st.dataframe(cpp, use_container_width=True, hide_index=True)
-
-    st.subheader("Por marca")
-    st.caption("Siempre las cuatro universidades: es una comparación.")
-    st.dataframe(R["cert_marca"], use_container_width=True, hide_index=True)
-
-
-# ==================================================================
-# CATÁLOGO: uso contra fecha de creación
-# ==================================================================
-elif seccion == "Catálogo":
-    st.header(TITULOS[seccion])
-    st.caption(f"Fuente: snapshot usuario×LE, columna Fecha de creación · {etiqueta_marca}")
-    cat = R["catalogo"]
-    g, coh = cat["les"], cat["cohortes_creacion"]
-    glosario(
-        "Horas captadas por cada curso del catálogo contra su fecha de creación.",
-        "Para cada LE se suman horas, inscripciones y alumnos del periodo, y se toma su "
-        "**fecha de creación** de la propia exportación. Las cohortes de creación se calculan "
-        "solas: cualquier fecha nueva que publique el proveedor entra sin tocar código.",
-        {"Curso dormido": "menos de 1 h de consumo en el periodo.",
-         "Cohorte de creación": "mes en que se creó la LE.",
-         "Horas por LE": "se dan media y mediana porque la distribución está muy sesgada."})
-    k = st.columns(4)
-    k[0].metric("Cursos con consumo", fmt(cat["n_les"]))
-    k[1].metric("Cursos dormidos (<1 h)", fmt(cat["n_dormidas"]),
-                f"{cat['n_dormidas']/cat['n_les']*100:.0f}% del catálogo", delta_color="off")
-    k[2].metric("Horas por curso", f"{cat['horas_por_le_media']:.1f}",
-                f"mediana {cat['horas_por_le_mediana']:.1f}", delta_color="off")
-    k[3].metric("Concentración top 5", f"{cat['share_top5']:.0f}%",
-                f"top 10: {cat['share_top10']:.0f}%", delta_color="off")
-
-    _g = g.dropna(subset=["creada"])
-    fig = go.Figure()
-    for dormida, color, nombre in [(False, AZUL, "Con uso (≥1 h)"), (True, GRIS_PREV, "Dormido (<1 h)")]:
-        sub = _g[_g["dormida"] == dormida]
-        if sub.empty:
-            continue
-        fig.add_trace(go.Scatter(
-            x=sub["creada"], y=sub["horas"], mode="markers", name=nombre,
-            marker=dict(color=color, size=(sub["usuarios"] / max(_g["usuarios"].max(), 1) * 26 + 6),
-                        line=dict(color="white", width=1)),
-            customdata=list(zip(sub["Nombre de la LE"], sub["usuarios"], sub["plantilla"])),
-            hovertemplate="%{customdata[0]}<br>Creada %{x|%d-%b-%Y}<br>%{y:,.1f} h<br>"
-                          "%{customdata[1]:,.0f} alumnos<br>Formato %{customdata[2]}<extra></extra>"))
-    fig.update_layout(title="Cada punto es un curso: cuándo se creó y cuántas horas capta "
-                            "(tamaño = alumnos)",
-                      xaxis_title="Fecha de creación", yaxis_title="Horas en el periodo")
-    fig.update_yaxes(rangemode="tozero")
-    show(fig, height=460)
-
-    c1, c2 = st.columns(2)
-    figa = go.Figure(go.Bar(x=coh["mes_ts"], y=coh["horas_por_le"], marker_color=AZUL,
-                            customdata=list(zip(coh["les"], coh["horas"])),
-                            hovertemplate="%{x|%b-%Y}<br>%{y:,.1f} h por curso<br>"
-                                          "%{customdata[0]} cursos · %{customdata[1]:,.0f} h<extra></extra>"))
-    figa.update_layout(title="Horas por curso según su mes de creación",
-                       yaxis_title="Horas / curso", xaxis_title="Mes de creación")
-    figa.update_yaxes(rangemode="tozero")
-    with c1:
-        show(figa, height=360)
-    figb = go.Figure()
-    figb.add_trace(go.Bar(name="Con uso", x=coh["mes_ts"], y=coh["les"] - coh["dormidas"],
-                          marker_color=AZUL))
-    figb.add_trace(go.Bar(name="Dormidos", x=coh["mes_ts"], y=coh["dormidas"], marker_color=GRIS_PREV))
-    figb.update_layout(barmode="stack", title="Cursos creados cada mes y cuántos están dormidos",
-                       yaxis_title="Cursos", xaxis_title="Mes de creación")
-    figb.update_yaxes(rangemode="tozero")
-    with c2:
-        show(figb, height=360)
-
-    with st.expander("Ver catálogo completo"):
-        _cols = [c for c in ["Nombre de la LE", "creada", "plantilla", "horas", "usuarios",
-                             "inscripciones", "horas_por_usuario", "avance_mediana",
-                             "certificados", "delta"] if c in g.columns]
-        st.dataframe(g[_cols].round(2), use_container_width=True, hide_index=True)
-
-
-# ==================================================================
-# FORMATO (plantilla)
-# ==================================================================
-elif seccion == "Formato":
-    st.header(TITULOS[seccion])
-    st.caption(f"Fuente: snapshot usuario×LE, columna Plantilla · {etiqueta_marca}")
-    fm = R["formato"]
-    if fm.empty:
-        st.info("Sin datos de formato en esta selección.")
-    else:
-        glosario(
-            "Horas de consumo por inscripción, según el formato con el que se construyó el curso.",
-            "`Plantilla` es el formato con el que se construyó la LE. Se dan horas totales, "
-            "horas por inscripción (media) y horas por alumno (mediana), más el reparto de avance "
-            "máximo por par (usuario, LE).",
-            {"Inscripción": "una fila usuario×LE, aunque tenga 0 h.",
-             "openModule / standardUnit": "los dos formatos más frecuentes del catálogo.",
-             "Media y mediana": "la mediana por alumno suele ser 0: la mayoría de las "
-                                "inscripciones no registran horas."})
-        k = st.columns(3)
-        k[0].metric("Formatos en uso", fmt(len(fm)))
-        k[1].metric("Inscripciones", fmt(fm["inscripciones"].sum()))
-        k[2].metric("Cursos", fmt(fm["les"].sum()))
-
-        _f = fm.sort_values("h_por_inscripcion_media")
-        fig = go.Figure(go.Bar(x=_f["h_por_inscripcion_media"] * 60, y=_f["Plantilla"],
-                               orientation="h", marker_color=AZUL,
-                               text=[f"{v*60:.1f} min" for v in _f["h_por_inscripcion_media"]],
-                               textposition="outside",
-                               customdata=list(zip(_f["inscripciones"], _f["horas"], _f["les"])),
-                               hovertemplate="%{y}<br>%{x:.1f} min por inscripción<br>"
-                                             "%{customdata[0]:,.0f} inscripciones · "
-                                             "%{customdata[1]:,.0f} h · %{customdata[2]} cursos<extra></extra>"))
-        fig.update_layout(title="Minutos de consumo por inscripción, según formato",
-                          xaxis_title="Minutos por inscripción",
-                          xaxis_range=[0, float(_f["h_por_inscripcion_media"].max()) * 60 * 1.35])
-        show(fig, height=340)
-
-        c1, c2 = st.columns(2)
-        # Los dos paneles comparten escala 0-100: son el mismo reparto visto por
-        # sus dos extremos y con ejes libres una barra corta parecia larga.
-        figa = go.Figure(go.Bar(x=_f["bajo20"], y=_f["Plantilla"], orientation="h",
-                                marker_color=AZUL,
-                                text=[f"{v:.0f}%" for v in _f["bajo20"]], textposition="inside",
-                                insidetextfont=dict(color="white")))
-        figa.update_layout(title="No pasa del 20% del curso", xaxis_title="% de pares",
-                           xaxis_range=[0, 100])
-        with c1:
-            show(figa, height=330)
-        figb = go.Figure(go.Bar(x=_f["alto80"], y=_f["Plantilla"], orientation="h",
-                                marker_color=AZUL_CLARO,
-                                text=[f"{v:.1f}%" for v in _f["alto80"]], textposition="outside"))
-        figb.update_layout(title="Llega al 80% o más", xaxis_title="% de pares",
-                           xaxis_range=[0, 100])
-        with c2:
-            show(figb, height=330)
-        with st.expander("Ver tabla"):
-            st.dataframe(fm.round(3), use_container_width=True, hide_index=True)
-
-
-# ==================================================================
-# RUTA MÁSTER
-# ==================================================================
-elif seccion == "Ruta Máster":
-    st.header(TITULOS[seccion])
-    st.caption(f"Los 18 cursos de la ruta, mapeados al catálogo por nombre · {etiqueta_marca}")
-    ru, rp = R["ruta"], R["ruta_prev"]
-    pc = ru["por_curso"]
-    if pc.empty:
-        st.info("Ninguno de los cursos de la ruta aparece en esta selección.")
-    else:
-        st.caption(f"Los {ru['n_cursos_encontrados']} cursos de la ruta concentran el "
-                   f"{ru['pct_horas_plataforma']:.0f}% de las horas del periodo. Mediana por "
-                   f"alumno: inscrito en {ru['inscritos_mediana']:.0f} de {ru['n_cursos_ruta']}, "
-                   f"consume {ru['cobertura_mediana']:.0f}.")
-        glosario(
-            "Cómo avanza la Ruta de Máster en IA: por curso y por alumno.",
-            "Los 18 nombres que entregó Academia se casan con el catálogo por nombre normalizado "
-            "(hoy resuelven 18 de 18). Por curso se dan alumnos, horas y % que llega al tramo "
-            "80-100%. Por alumno se cuenta cuántos de los 18 toca (cobertura) y cuántos completa.",
-            {"Cobertura": "cursos distintos de la ruta que el alumno consume (horas > 0).",
-             "Completado": "el alumno llega al tramo 80-100% de ese curso.",
-             "Ruta terminada": "alumnos con los 18 cursos en tramo 80-100%.",
-             "Mapeo": "por nombre normalizado, no por ID. La lista vive en `RUTA_MASTER` "
-                      "(pipeline.py)."})
-        if ru["no_encontrados"]:
-            st.warning("Sin match en el catálogo: " + ", ".join(ru["no_encontrados"]))
-
-        k = st.columns(4)
-        k[0].metric("Alumnos en la ruta", fmt(ru["usuarios"]))
-        k[1].metric("Cursos de la ruta consumidos", f"{ru['cobertura_media']:.1f}",
-                    f"inscritos en {ru['inscritos_media']:.1f} de {ru['n_cursos_ruta']}",
-                    delta_color="off")
-        k[2].metric("Horas en la ruta por alumno", f"{ru['horas_media']*60:.0f} min",
-                    f"mediana {ru['horas_mediana']*60:.0f} min", delta_color="off")
-        k[3].metric("Rutas completadas", fmt(ru["ruta_terminada"]),
-                    delta_txt(mom_pct(ru["ruta_terminada"], rp["ruta_terminada"])))
-
-        # Un panel por metrica: alumnos y % completado no comparten unidad.
-        _o = pc.iloc[::-1]
-        c1, c2 = st.columns(2)
-        figa = go.Figure(go.Bar(x=_o["usuarios"], y=[corto(s, 40) for s in _o["curso_ruta"]],
-                                orientation="h", marker_color=AZUL,
-                                text=[fmt(v) for v in _o["usuarios"]], textposition="auto",
-                                customdata=list(zip(_o["curso_ruta"], _o["horas"])),
-                                hovertemplate="%{customdata[0]}<br>%{x:,.0f} alumnos<br>"
-                                              "%{customdata[1]:,.1f} h<extra></extra>"))
-        figa.update_layout(title="Alumnos por curso de la ruta", xaxis_title="Alumnos")
-        figa.update_xaxes(rangemode="tozero")
-        with c1:
-            show(figa, height=560)
-        figb = go.Figure(go.Bar(x=_o["completado_pct"], y=[corto(s, 40) for s in _o["curso_ruta"]],
-                                orientation="h", marker_color=AZUL_CLARO,
-                                text=[f"{v:.1f}%" for v in _o["completado_pct"]],
-                                textposition="outside",
-                                customdata=list(zip(_o["curso_ruta"], _o["certificados"])),
-                                hovertemplate="%{customdata[0]}<br>%{x:.1f}% llega al 80-100%<br>"
-                                              "%{customdata[1]:,.0f} certificados<extra></extra>"))
-        figb.update_layout(title="% de alumnos que completa cada curso", xaxis_title="% completado",
-                           xaxis_range=[0, float(pc["completado_pct"].max()) * 1.4])
-        with c2:
-            show(figb, height=560)
-
-        st.subheader("Cuántos cursos de la ruta consume cada alumno")
-        st.caption("«Consumido» es con horas > 0, no inscrito: la asignación es masiva y casi "
-                   "todos los alumnos aparecen inscritos en la ruta entera.")
-        dcob, dcom = ru["dist_cobertura"], ru["dist_completos"]
-        fig = go.Figure()
-        fig.add_trace(go.Bar(name="Cursos consumidos", x=list(dcob.index), y=list(dcob.values),
-                             marker_color=AZUL))
-        fig.add_trace(go.Bar(name="Cursos completados", x=list(dcom.index), y=list(dcom.values),
-                             marker_color=GRIS_PREV))
-        fig.update_layout(barmode="group", xaxis_title="Cursos de la ruta (de 18)",
-                          yaxis_title="Alumnos", bargap=0.2)
-        fig.update_yaxes(rangemode="tozero")
-        show(fig, height=380)
-        with st.expander("Ver tabla por curso"):
-            st.dataframe(pc.drop(columns=["orden"]).round(2), use_container_width=True,
-                         hide_index=True)
-
-
-# ==================================================================
-# CENTRO Y NIVEL
-# ==================================================================
-elif seccion == "Centro y Nivel":
-    st.header(TITULOS[seccion])
-    st.caption(f"Centro inferido del dominio del correo · Nivel del propio export · {etiqueta_marca}")
-    ce, ni = R["centro"], R["nivel"]
-    if "pct_licencia_efectiva" in ce.columns and ce["pct_licencia_efectiva"].notna().any():
-        _alto = ce.loc[ce["pct_licencia_efectiva"].idxmax()]
-        _bajo = ce.loc[ce["pct_licencia_efectiva"].idxmin()]
-        st.caption(f"Activación sobre licencia: de {_alto['pct_licencia_efectiva']:.1f}% en "
-                   f"{_alto['Centro']} a {_bajo['pct_licencia_efectiva']:.1f}% en "
-                   f"{_bajo['Centro']}.")
-    glosario(
-        "El mismo tablero cortado por centro educativo y por nivel.",
-        "El **Centro** se infiere del dominio del correo (el mapeo dominio a centro es uno a uno "
-        "en toda la base y rellena el ~0.6% de nulos del proveedor). El **Nivel** viene en el "
-        "export. Las licencias salen del roster, así que la activación se mide sobre la base real "
-        "de cada centro.",
-        {"% licencia inscrita": "usuarios del centro con alguna inscripción / licencias del centro.",
-         "% licencia efectiva": "usuarios del centro con más de 0 h / licencias del centro.",
-         "Media y mediana": "horas por usuario activado, expresadas en minutos."})
-
-    for etiqueta, df, col in [("Por centro", ce, "Centro"), ("Por nivel", ni, "Nivel")]:
-        st.subheader(etiqueta)
-        _x = df[col]
-        cols_fig = st.columns(2)
-        if "pct_licencia_efectiva" in df.columns and df["pct_licencia_efectiva"].notna().any():
-            figa = go.Figure()
-            figa.add_trace(go.Bar(name="% licencia inscrita", x=_x, y=df["pct_licencia_inscrita"],
-                                  marker_color=GRIS_PREV))
-            figa.add_trace(go.Bar(name="% licencia efectiva", x=_x, y=df["pct_licencia_efectiva"],
-                                  marker_color=AZUL))
-            figa.update_layout(barmode="group", title="Activación sobre licencias",
-                               yaxis_title="% de licencias", bargap=0.3)
-            figa.update_yaxes(rangemode="tozero")
-            with cols_fig[0]:
-                show(figa, height=340)
-        figb = go.Figure()
-        figb.add_trace(go.Bar(name="Media", x=_x, y=df["media_act"] * 60, marker_color=AZUL_CLARO))
-        figb.add_trace(go.Bar(name="Mediana", x=_x, y=df["mediana_act"] * 60, marker_color=AZUL))
-        figb.update_layout(barmode="group", title="Minutos por alumno activado",
-                           yaxis_title="Minutos", bargap=0.3)
-        figb.update_yaxes(rangemode="tozero")
-        with cols_fig[1]:
-            show(figb, height=340)
-        st.dataframe(df.round(2), use_container_width=True, hide_index=True)
+    with st.expander("Ver tabla"):
+        _t = emb[["etapa", "usuarios", "pct_base", "pct_paso"]].copy()
+        _t["usuarios_anterior"] = [_m.get(e, np.nan) for e in _t["etapa"]]
+        st.dataframe(_t.round(1), use_container_width=True, hide_index=True)

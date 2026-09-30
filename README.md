@@ -61,15 +61,18 @@ cada carpeta (`load_latest`, igual que el notebook).
 
 ## Secciones
 
-Navegación y filtro viven en la barra superior (`st.segmented_control`), no en el sidebar.
-Son **tres filas**: grupo, sección dentro del grupo y marca.
+Navegación y filtro viven en la barra superior (`st.segmented_control`), no en el sidebar:
+**una fila de secciones** y debajo la fila de marca.
 
-Los grupos agrupan por el objeto que miden: **Periodo**, **Usuarios** y **Contenido**. Con 16
-secciones en una sola fila la barra se volvía ilegible, por eso la navegación es de dos niveles.
+Depuración del 30-Sep-2026: de 16 secciones en tres grupos se pasó a **10 en una sola fila**,
+en el orden del deck del comité. Salieron Resumen, Certificación, Centro y Nivel, Catálogo,
+Formato, Ruta Máster, el bloque gateway y la comparación con el lift del deck. Sus funciones
+siguen en `pipeline.py` (las usan `generar_taller_kpis.py` y `generar_onepager_ceo.py`).
 
 **El filtro de marca solo aparece donde cambia los números.** Tendencias y Pulso se
 calculan sobre la serie diaria de plataforma, que el proveedor no desglosa por universidad
-(`SIN_MARCA` en `app.py`), así que ahí el control se oculta y una nota explica por qué.
+(`SIN_MARCA` en `app.py`); ahí el control se oculta y el encabezado dice «global, sin
+desglose por marca».
 
 En **Panorama** el filtro sí está, y **cambia la fuente de los KPIs**:
 
@@ -79,40 +82,39 @@ En **Panorama** el filtro sí está, y **cambia la fuente de los KPIs**:
 | una universidad | snapshot usuario×LE de esa marca | 3 (horas, contenidos, usuarios con consumo) |
 
 Los dos juegos **no son comparables entre sí**: miden universos distintos (la serie diaria
-reporta ~3x las horas del snapshot). Nunca se muestran en la misma fila, y el `caption` y el
-glosario dicen en cada caso de dónde salen los números. Sin esto el filtro habría sido
-decorativo en Panorama, o peor: los 4 KPIs globales parecerían ser de la marca elegida.
+reporta ~3x las horas del snapshot). Nunca se muestran en la misma fila.
 
 Los bloques «Por marca» son comparaciones y **siempre muestran las cuatro universidades**,
-con la seleccionada resaltada y las demás a menor opacidad. Filtrarlos a una sola dejaba una
-barra huérfana; en Profundidad, además, la dispersión entre marcas se calculaba sobre una
-única fila (max - min = 0), así que el caption reportaba una brecha de 0 puntos sin nada que
-comparar.
+con la seleccionada a opacidad plena y las demás atenuadas (`_opacidad()`).
 
 La marca elegida se guarda en `st.session_state.marca_activa`, no en la key del widget:
 al ocultarse el control en una sección global, Streamlit descarta el estado de su key y la
-selección se perdería al volver a una sección con filtro.
+selección se perdería al volver a una sección con filtro. La sección activa vive igual en
+`st.session_state.seccion_activa`.
 
-| Grupo | Pestaña | Contenido | Fuente |
-|-------|---------|-----------|--------|
-| Periodo | Resumen | Los 3 KPIs de cabecera y dónde se detalla cada uno | snapshot + roster + panel |
-| Periodo | Panorama | KPIs del periodo, variación y por marca | serie diaria + snapshot |
-| Periodo | Certificación | Certificados obtenidos, tasa por alumno y evolución | snapshot usuario×LE |
-| Periodo | Pulso | Serie larga anotada | serie diaria larga |
-| Usuarios | Activación | Embudo de usuarios únicos y activos vs efectivos | roster + snapshot |
-| Usuarios | Profundidad | Activación, intensidad, media contra mediana y concentración | snapshot usuario×LE |
-| Usuarios | Abandono | Avance máximo por tramos | snapshot usuario×LE |
-| Usuarios | Retención | Retención por cohorte | panel histórico |
-| Usuarios | Crecimiento | Growth accounting (global + marca) | panel histórico |
-| Usuarios | Tendencias | Ritmo diario del periodo actual | serie diaria |
-| Usuarios | Centro y Nivel | Activación sobre licencias por centro y nivel | snapshot + roster |
-| Contenido | Cursos | Top/bottom LEs por horas y por Δ | snapshot usuario×LE |
-| Contenido | Catálogo | Uso contra fecha de creación, cursos dormidos | snapshot usuario×LE |
-| Contenido | Formato | Horas por inscripción según plantilla de curso | snapshot usuario×LE |
-| Contenido | Ruta Máster | Los 18 cursos de la ruta: avance y cobertura | snapshot usuario×LE |
-| Contenido | Lift | Lift de retención por LE (gancho vs callejón) | panel histórico |
+| Pestaña | Contenido | Fuente |
+|---------|-----------|--------|
+| Panorama | KPIs del periodo, variación y por marca | serie diaria + snapshot |
+| Pulso | Serie larga de horas, con huecos donde faltan días | serie diaria larga |
+| Tendencias | Ritmo diario del periodo actual | serie diaria |
+| Intensidad | Media, mediana, percentiles, activación y segmentos (global + marca) | snapshot usuario×LE |
+| Crecimiento | Growth accounting (global + marca) | panel histórico |
+| Retención | Retención por cohorte | panel histórico |
+| Abandono | Avance máximo por tramos (global + marca) | snapshot usuario×LE |
+| Cursos | Cursos con más y menos usuarios con consumo, y top 5 de Δ horas | snapshot usuario×LE |
+| Puente y callejón | Lift de retención por LE (puente = lift > 0, callejón = lift < 0) | panel histórico |
+| Activación | Embudo de usuarios únicos, licencia a 5 h | roster + snapshot |
 
-Las 16 secciones se prueban con `streamlit.testing.v1.AppTest`, con y sin filtro de marca.
+Activación es la única sección que no viene del deck.
+
+**Estructura fija de cada sección:** `encabezado()` (título + una línea con fecha de corte,
+periodo, fuente y marca) y `glosario()` (expander «Cómo leer esto»: qué muestra, cómo se
+calcula, definiciones). No hay más texto: sin captions de lectura ni cifras sueltas.
+
+**Fecha de corte** = último día con dato en la serie del periodo actual (`meta["corte"]`,
+`pipeline._fecha_corte`). Las etiquetas de periodo usan meses en español (`MES_ABR`).
+
+Las 10 secciones se prueban con `streamlit.testing.v1.AppTest`, con y sin filtro de marca.
 
 ### El dashboard es 100% descriptivo
 
@@ -121,10 +123,9 @@ y se limpiaron glosarios y captions de juicios, diagnósticos y recomendaciones.
 dato, definición y método de cálculo. Las conclusiones y las decisiones viven en
 `FABLE-5-ANALYSIS.md` y en los decks del comité, no en la app.
 
-Al quitar un titular que traía una cifra ausente de las gráficas, esa cifra se conservó como
-`st.caption` neutro: pico de la serie larga, retorno en +1 de las cohortes, saldo neto de
-growth accounting, tasa de certificación entre los que llegan al 80-100%, rango de activación
-por centro y peso de la Ruta Máster.
+Desde el 30-Sep-2026 tampoco quedan los `st.caption` con cifras sueltas (pico de la serie,
+retorno en +1, saldo neto, dispersión entre marcas, media/mediana): solo título, corte,
+fuente y el bloque «Cómo leer esto».
 
 **Regla al añadir secciones:** ningún texto de UI debe afirmar causa («el problema es…»),
 valorar («solo», «apenas», «la ruta es la plataforma») ni sugerir acción («hay que», «es

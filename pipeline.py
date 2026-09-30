@@ -191,7 +191,9 @@ def _fmt_rango(serie_fecha: pd.Series) -> str:
     f = pd.to_datetime(serie_fecha, errors="coerce").dropna()
     if f.empty:
         return "s/d"
-    return f"{f.min():%d-%b} → {f.max():%d-%b}"
+    # Meses en espannol desde MES_ABR: %b dependia del locale y salia "Aug".
+    ini, fin = f.min(), f.max()
+    return f"{ini.day:02d}-{MES_ABR[ini.month]} → {fin.day:02d}-{MES_ABR[fin.month]}"
 
 
 # Columnas de texto con poquisimos valores distintos (4 a 120 sobre cientos de
@@ -454,7 +456,45 @@ def top_les(d: dict, n: int = 5) -> dict:
     top_horas = m.sort_values("horas_cur", ascending=False).head(n)
     top_mejora = m[m["horas_prev"] >= 1].sort_values("delta", ascending=False).head(n)
     bottom_caida = m[m["horas_prev"] >= 1].sort_values("delta").head(n)
-    return {"top_horas": top_horas, "top_mejora": top_mejora, "bottom_caida": bottom_caida}
+    return {"top_horas": top_horas, "top_mejora": top_mejora, "bottom_caida": bottom_caida,
+            "usuarios": usuarios_les(d)}
+
+
+def usuarios_les(d: dict) -> pd.DataFrame:
+    """Usuarios distintos con horas > 0 por LE, periodo actual y anterior.
+
+    Se cuenta consumo y no inscripcion: la asignacion es masiva y casi todos los
+    alumnos aparecen inscritos. Solo entran LEs con al menos 1 usuario con consumo
+    en el periodo actual, ordenadas de mayor a menor (desempate por ID).
+    """
+    def por_le(df, sufijo):
+        c = df[df["Horas de aprendizaje"] > 0]
+        g = (c.groupby(["ID de la LE", "Nombre de la LE"], as_index=False, observed=True)
+             .agg(usuarios=("Usuario", "nunique"), horas=("Horas de aprendizaje", "sum")))
+        return _descat(g).rename(columns={"usuarios": f"usuarios_{sufijo}",
+                                          "horas": f"horas_{sufijo}"})
+    cur = por_le(d["cpu_cur"], "cur")
+    prev = por_le(d["cpu_prev"], "prev")
+    m = cur.merge(prev[["ID de la LE", "usuarios_prev", "horas_prev"]],
+                  on="ID de la LE", how="left").fillna({"usuarios_prev": 0, "horas_prev": 0})
+    m["delta_usuarios"] = m["usuarios_cur"] - m["usuarios_prev"]
+    return (m.sort_values(["usuarios_cur", "ID de la LE"], ascending=[False, True])
+            .reset_index(drop=True))
+
+
+def abandono_por_marca(d: dict) -> pd.DataFrame:
+    """Reparto del avance maximo por par (usuario, LE) de cada marca, periodo actual."""
+    rows = []
+    for marca in MARCAS_4:
+        cur_m = d["cpu_cur"][d["cpu_cur"]["Universidad"] == marca]
+        if cur_m.empty:
+            continue
+        ab = abandono(cur_m)
+        row = {"Universidad": marca, "pares": len(ab["detalle"])}
+        for t in (10, 35, 65, 90):
+            row[t] = float(ab["dist_tramos"].get(t, 0.0))
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 # ==================================================================
@@ -1210,8 +1250,18 @@ def cargar_base(cur_path=CUR_PATH, prev_path=PREV_PATH, hist_dir=HIST_DIR) -> di
             "prev_label": d["prev_label"],
             "generado": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
             "ejes": [p["eje"] for p in periodos],
+            "corte": _fecha_corte(d["horas_cur"]),
         },
     }
+
+
+def _fecha_corte(horas_df: pd.DataFrame) -> str:
+    """Ultimo dia con dato en la serie del periodo actual, en formato 29-Sep-2026."""
+    f = pd.to_datetime(horas_df["fecha"], errors="coerce").dropna()
+    if f.empty:
+        return "s/d"
+    u = f.max()
+    return f"{u.day:02d}-{MES_ABR[u.month]}-{u.year}"
 
 
 def computar(base: dict, marcas=None) -> dict:
@@ -1241,6 +1291,7 @@ def computar(base: dict, marcas=None) -> dict:
         "segmentacion_marca": segmentacion_por_marca(d),
         "abandono_cur": abandono(cpu_cur),
         "abandono_prev": abandono(cpu_prev),
+        "abandono_marca": abandono_por_marca(d),
         "top_les": top_les(d_marca),
         # Sección 2 (marca-aware)
         "growth": growth_accounting(panel_f, ordenes),
