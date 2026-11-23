@@ -41,6 +41,18 @@ CUR_PATH = os.path.join(ROOT, "mnt", "data", "current")
 PREV_PATH = os.path.join(ROOT, "mnt", "data", "previous")
 HIST_DIR = os.path.join(ROOT, "datos_analisis_estrategico_2026")
 
+# Modo CALENDARIO (desde nov-2026): export anual del portal con un snapshot por
+# mes calendario en `Pottencia Year/month_to_month/<mes>_<aa>/` y las 4 series
+# diarias completas en `Pottencia Year/`. Si la carpeta existe, manda sobre
+# current/previous y sobre datos_analisis_estrategico_2026: periodos = meses
+# calendario, actual = ultimo mes COMPLETO de la serie, anterior = el previo.
+ANUAL_ROOT = os.path.join(ROOT, "Pottencia Year")
+ANUAL_DIR = os.path.join(ANUAL_ROOT, "month_to_month")
+# Nombres de carpeta del export anual (mezclan ingles y espannol: dec_25, abr_26).
+MES_TOKEN = {"ene": 1, "jan": 1, "feb": 2, "mar": 3, "abr": 4, "apr": 4, "may": 5,
+             "jun": 6, "jul": 7, "ago": 8, "aug": 8, "sep": 9, "oct": 10,
+             "nov": 11, "dic": 12, "dec": 12}
+
 # Modo "preparado": si existe dashboard/data/ (parquet slim), la app lo usa
 # (deployment autocontenido en Streamlit Cloud). Si no, lee los CSV crudos del
 # proveedor en el layout ODILO (desarrollo local). Ver preparar_datos.py.
@@ -130,6 +142,37 @@ RUTA_MASTER = [
 
 SEG_ORDER = ["Exploradores", "Constantes", "Intensivos", "Power users"]
 
+# Nivel / poblacion (definicion de Santiago, 23-Nov-2026): DOCENTES son los
+# usuarios con Curso/Nivel = "MedioSuperior,Superior" (el valor combinado
+# exacto), no los que traen "Superior" ni "MedioSuperior" por separado. La
+# etiqueta es estable por usuario (verificado en los 13 snapshots: nadie la
+# cambia de un mes a otro), asi que la poblacion se resuelve por fila.
+DOCENTES = "Docentes"
+ALUMNOS = "Alumnos"
+POBLACIONES = [ALUMNOS, DOCENTES]
+NIVEL_MAP = {"superior": "Superior", "licenciatura": "Superior",
+             "licenciatura udg": "Superior",
+             "mediosuperior": "Medio superior", "medio superior": "Medio superior",
+             "mediasuperior": "Medio superior", "bachillerato udg": "Medio superior",
+             "mediosuperior,superior": DOCENTES}
+
+
+def normalizar_nivel(serie: pd.Series) -> pd.Series:
+    """Unifica las grafias del proveedor (MedioSuperior, Mediosuperior,
+    medioSuperior, LICENCIATURA...) y separa a los docentes."""
+    s = serie.astype(object).where(serie.notna(), "")
+    return (s.astype(str).str.strip().str.lower().str.replace(" ,", ",").map(NIVEL_MAP)
+            .fillna("Sin dato"))
+
+
+def etiqueta_mes(orden: int) -> str:
+    """Etiqueta de eje de un periodo. `orden` = anno*12 + (mes-1) en modo
+    calendario (Nov-25, Dic-25, ...) y 1-12 en los paneles viejos de un solo anno."""
+    o = int(orden)
+    if o <= 12:
+        return MES_ABR[o]
+    return f"{MES_ABR[o % 12 + 1]}-{(o // 12) % 100:02d}"
+
 
 # ------------------------------------------------------------------
 # Helpers de limpieza (idénticos al notebook)
@@ -158,6 +201,20 @@ def limpiar_usuarios(df: pd.DataFrame) -> pd.DataFrame:
         df["Centro"] = df["Centro"].fillna("").replace("", np.nan).fillna(_dom)
     else:
         df["Centro"] = _dom
+    _poblacion(df)
+    return df
+
+
+def _poblacion(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza `Nivel` y deriva `Poblacion` (Docentes / Alumnos), en sitio.
+
+    Idempotente: sirve tanto para CSV crudos como para parquet preparados antes
+    de que existiera la columna."""
+    if "Nivel" in df.columns:
+        df["Nivel"] = normalizar_nivel(df["Nivel"])
+        df["Poblacion"] = np.where(df["Nivel"].eq(DOCENTES), DOCENTES, ALUMNOS)
+    elif "Poblacion" not in df.columns:
+        df["Poblacion"] = ALUMNOS
     return df
 
 
@@ -205,7 +262,7 @@ def _fmt_rango(serie_fecha: pd.Series) -> str:
 # ningun resultado (verificado con un digest completo de `computar`).
 COLS_CATEGORIA = ("Usuario", "ID de la LE", "Nombre de la LE", "Tramo porcentaje",
                   "Universidad", "Plantilla", "Nivel", "Certificado", "Centro",
-                  "Fecha de creación")
+                  "Fecha de creación", "Poblacion")
 
 
 def _compactar(df: pd.DataFrame) -> pd.DataFrame:
@@ -256,11 +313,29 @@ def _leer_parquet(path: str) -> pd.DataFrame:
 # ==================================================================
 # CARGA CRUDA  (Sección 1 del notebook: current vs previous)
 # ==================================================================
+def _con_poblacion(df: pd.DataFrame) -> pd.DataFrame:
+    """Parquet preparados antes de nov-2026 no traen `Poblacion`: se deriva."""
+    if df is None or "Poblacion" in df.columns:
+        return df
+    return _compactar(_poblacion(df))
+
+
+def _leer_meta_preparada() -> dict:
+    import json
+    f = os.path.join(PREPARED_DIR, "meta.json")
+    return json.load(open(f)) if os.path.exists(f) else {}
+
+
 def _cargar_snapshots_prepared() -> dict:
     """Lee los frames ya limpios/slim en parquet (deployment)."""
     out = {}
-    out["cpu_cur"] = _leer_parquet(os.path.join(PREPARED_DIR, "current", "snapshot.parquet"))
-    out["cpu_prev"] = _leer_parquet(os.path.join(PREPARED_DIR, "previous", "snapshot.parquet"))
+    out.update(_leer_meta_preparada())
+    if out.get("modo") == "calendario":
+        sa = pd.read_parquet(os.path.join(PREPARED_DIR, "historico", "serie_larga_horas.parquet"))
+        sa["fecha"] = pd.to_datetime(sa["fecha"], errors="coerce")
+        out["serie_anual_horas"] = sa
+    out["cpu_cur"] = _con_poblacion(_leer_parquet(os.path.join(PREPARED_DIR, "current", "snapshot.parquet")))
+    out["cpu_prev"] = _con_poblacion(_leer_parquet(os.path.join(PREPARED_DIR, "previous", "snapshot.parquet")))
     for lado, path in [("cur", "current"), ("prev", "previous")]:
         out[f"horas_{lado}"] = pd.read_parquet(os.path.join(PREPARED_DIR, path, "horas.parquet"))
         out[f"consumo_mensual_{lado}"] = pd.read_parquet(os.path.join(PREPARED_DIR, path, "consumo.parquet"))
@@ -273,8 +348,98 @@ def _cargar_snapshots_prepared() -> dict:
         if COL_USU_RAW not in u.columns:      # parquet anterior a esta version
             u[COL_USU_RAW] = u[COL_USU] * FACTOR_EFECTIVOS
     # usuarios efectivos YA vienen corregidos (÷2) desde preparar_datos → no re-dividir
-    out["cur_label"] = _fmt_rango(out["horas_cur"]["fecha"])
-    out["prev_label"] = _fmt_rango(out["horas_prev"]["fecha"])
+    out["cur_label"] = _etiqueta_periodo(out, "cur")
+    out["prev_label"] = _etiqueta_periodo(out, "prev")
+    return out
+
+
+def _etiqueta_periodo(d: dict, lado: str) -> str:
+    rango = _fmt_rango(d[f"horas_{lado}"]["fecha"])
+    if d.get("modo") == "calendario":
+        return f"{etiqueta_mes(d[f'orden_{lado}'])} ({rango})"
+    return rango
+
+
+# ------------------------------------------------------------------
+# Modo calendario: export anual `Pottencia Year/`
+# ------------------------------------------------------------------
+def meses_anuales(anual_dir=ANUAL_DIR) -> list:
+    """[(orden, carpeta)] de los snapshots mensuales del export anual, ordenados.
+
+    Carpeta = `<mes>_<aa>` (nov_25, dec_25, abr_26...). orden = anno*12 + mes-1."""
+    out = []
+    if not os.path.isdir(anual_dir):
+        return out
+    for nombre in os.listdir(anual_dir):
+        m = re.fullmatch(r"([a-z]{3})_(\d{2})", nombre.lower())
+        if not m or m.group(1) not in MES_TOKEN:
+            continue
+        carpeta = os.path.join(anual_dir, nombre)
+        if not glob.glob(os.path.join(carpeta, "consumo_por_usuario__*.csv")):
+            continue
+        anno = 2000 + int(m.group(2))
+        out.append((anno * 12 + MES_TOKEN[m.group(1)] - 1, carpeta))
+    return sorted(out)
+
+
+def _orden_de_fecha(f) -> int:
+    return int(f.year * 12 + f.month - 1)
+
+
+def meses_completos(serie_fechas: pd.Series) -> set:
+    """Meses cuyo ultimo dia ya esta en la serie diaria (el ultimo export suele
+    cortar a mitad de mes: ese mes queda marcado como parcial)."""
+    f = pd.to_datetime(serie_fechas, errors="coerce").dropna()
+    if f.empty:
+        return set()
+    ultimo = f.max()
+    meses = {_orden_de_fecha(x) for x in f}
+    fin_ultimo = ultimo + pd.offsets.MonthEnd(0)
+    return {o for o in meses if not (o == _orden_de_fecha(ultimo) and ultimo < fin_ultimo)}
+
+
+def _serie_anual(patron: str) -> pd.DataFrame:
+    s = _load_latest(ANUAL_ROOT, patron)
+    s["fecha"] = pd.to_datetime(s["fecha"], errors="coerce")
+    return s.dropna(subset=["fecha"]).sort_values("fecha").reset_index(drop=True)
+
+
+def _cargar_snapshot_mes(carpeta: str) -> pd.DataFrame:
+    f = max(glob.glob(os.path.join(carpeta, "consumo_por_usuario__*.csv")), key=os.path.getmtime)
+    return _compactar(_cargar_snapshot_hist(f))
+
+
+def _cargar_calendario(anual_dir=ANUAL_DIR) -> dict:
+    """Actual = ultimo mes completo de la serie diaria; anterior = el mes previo.
+
+    Snapshot y serie diaria quedan alineados al mismo mes calendario, asi que
+    desaparece el desfase de las ventanas de 30 dias (ver FABLE-5-MAP, 18-Nov)."""
+    meses = meses_anuales(anual_dir)
+    horas = _serie_anual("Horas_de_aprendizaje_*.csv")
+    consumo = _serie_anual("Consumo_mensual_*.csv")
+    usuarios = _serie_anual("Usuarios_mensuales_*.csv")
+    completos = meses_completos(horas["fecha"])
+    candidatos = [o for o, _ in meses if o in completos]
+    if len(candidatos) < 2:
+        raise FileNotFoundError("El export anual necesita al menos dos meses completos.")
+    o_cur, o_prev = candidatos[-1], candidatos[-2]
+    carpeta = dict(meses)
+    out = {"modo": "calendario", "orden_cur": o_cur, "orden_prev": o_prev,
+           "parciales": [o for o, _ in meses if o not in completos],
+           "meses": meses}
+    for lado, o in (("cur", o_cur), ("prev", o_prev)):
+        def _mes(s):
+            return s[s["fecha"].map(_orden_de_fecha) == o].reset_index(drop=True)
+        out[f"horas_{lado}"] = _mes(horas)
+        out[f"consumo_mensual_{lado}"] = _mes(consumo)
+        u = _mes(usuarios).copy()
+        u[COL_USU_RAW] = u[COL_USU]
+        u[COL_USU] = u[COL_USU] / FACTOR_EFECTIVOS
+        out[f"usuarios_mensuales_{lado}"] = u
+        out[f"cpu_{lado}"] = _cargar_snapshot_mes(carpeta[o])
+    out["serie_anual_horas"] = horas
+    out["cur_label"] = _etiqueta_periodo(out, "cur")
+    out["prev_label"] = _etiqueta_periodo(out, "prev")
     return out
 
 
@@ -282,6 +447,8 @@ def cargar_snapshots_mensuales(cur_path=CUR_PATH, prev_path=PREV_PATH) -> dict:
     """Devuelve todos los objetos que necesita la Sección 1 (mes actual vs anterior)."""
     if USE_PREPARED:
         return _cargar_snapshots_prepared()
+    if meses_anuales():
+        return _cargar_calendario()
     out = {}
     out["consumo_mensual_cur"] = _load_latest(cur_path, "Consumo_mensual_*.csv")
     out["usuarios_mensuales_cur"] = _load_latest(cur_path, "Usuarios_mensuales_*.csv")
@@ -328,6 +495,21 @@ def panorama_kpis(d: dict) -> pd.DataFrame:
          d["usuarios_mensuales_prev"][COL_USU].sum()),
     ]
     df = pd.DataFrame(filas, columns=["kpi", "actual", "anterior"])
+    df["delta_pct"] = df.apply(lambda r: mom_change(r["actual"], r["anterior"]), axis=1)
+    return df
+
+
+def panorama_snapshot(cpu_cur: pd.DataFrame, cpu_prev: pd.DataFrame) -> pd.DataFrame:
+    """KPIs del periodo desde el snapshot usuario x LE (para una marca o una
+    poblacion, que la serie diaria de plataforma no desglosa)."""
+    # Misma definicion que panorama_por_marca: usuarios distintos con al menos
+    # un registro en el periodo.
+    def k(df):
+        return (float(df["Horas de aprendizaje"].sum()),
+                float(df["Nº de contenidos consumidos"].sum()), float(df["Usuario"].nunique()))
+    a, b = k(cpu_cur), k(cpu_prev)
+    df = pd.DataFrame({"kpi": ["Horas consumidas", "Contenidos consumidos", "Usuarios con consumo"],
+                       "actual": a, "anterior": b})
     df["delta_pct"] = df.apply(lambda r: mom_change(r["actual"], r["anterior"]), axis=1)
     return df
 
@@ -508,13 +690,40 @@ def _cargar_snapshot_hist(path: str) -> pd.DataFrame:
 def construir_periodos(d: dict, hist_dir=HIST_DIR) -> list:
     """Panel de periodos: snapshots calendario del histórico + previous + current."""
     periodos = []
+    calendario = d.get("modo") == "calendario"
+    # En modo calendario actual y anterior YA son meses del panel: se reutilizan
+    # sus frames en vez de leerlos dos veces (la memoria en Cloud es el limite).
+    reuso = ({d["orden_cur"]: d["cpu_cur"], d["orden_prev"]: d["cpu_prev"]}
+             if calendario else {})
     if USE_PREPARED:
         for f in sorted(glob.glob(os.path.join(PREPARED_DIR, "historico", "snapshot_*.parquet"))):
             orden = int(re.search(r"snapshot_(\d+)\.parquet", f).group(1))
-            periodos.append({"orden": orden, "label": MESES_ES_INV.get(orden, MES_ABR[orden]),
-                             "df": _leer_parquet(f)})
+            df = reuso.get(orden)
+            if df is None:
+                df = _con_poblacion(_leer_parquet(f))
+            periodos.append({"orden": orden,
+                             "label": MESES_ES_INV.get(orden, etiqueta_mes(orden)),
+                             "df": df})
+        # preparar_datos no duplica actual/anterior dentro de historico/
+        vistos = {p["orden"] for p in periodos}
+        for orden, df in reuso.items():
+            if orden not in vistos:
+                periodos.append({"orden": orden, "label": etiqueta_mes(orden), "df": df})
+    elif calendario:
+        for orden, carpeta in d["meses"]:
+            df = reuso.get(orden)
+            if df is None:
+                df = _cargar_snapshot_mes(carpeta)
+            periodos.append({"orden": orden, "label": etiqueta_mes(orden), "df": df})
     else:
         periodos = _construir_periodos_hist_csv(hist_dir)
+    if calendario:
+        parciales = set(d.get("parciales", []))
+        periodos = sorted(periodos, key=lambda p: p["orden"])
+        for p in periodos:
+            p["eje"] = etiqueta_mes(p["orden"]) + ("*" if p["orden"] in parciales else "")
+            p["parcial"] = p["orden"] in parciales
+        return periodos
     return _cerrar_periodos(periodos, d)
 
 
@@ -553,9 +762,11 @@ def _cerrar_periodos(periodos, d):
 def panel_usuario_mes(periodos: list) -> pd.DataFrame:
     filas = []
     for p in periodos:
-        g = (p["df"].groupby("Usuario", observed=True)
-             .agg(horas=("Horas de aprendizaje", "sum"),
-                  Universidad=("Universidad", "first")).reset_index())
+        df = p["df"]
+        agg = dict(horas=("Horas de aprendizaje", "sum"), Universidad=("Universidad", "first"))
+        if "Poblacion" in df.columns:
+            agg["Poblacion"] = ("Poblacion", "first")
+        g = df.groupby("Usuario", observed=True).agg(**agg).reset_index()
         g["orden"] = p["orden"]
         g["eje"] = p["eje"]
         filas.append(g)
@@ -568,8 +779,17 @@ def _activos_por_mes(panel, ordenes):
     return {o: set(panel[(panel["orden"] == o) & panel["activo"]]["Usuario"]) for o in ordenes}
 
 
+def _ejes_panel(panel: pd.DataFrame) -> dict:
+    """orden -> etiqueta de eje tal como la fijo construir_periodos (incluye el
+    asterisco de mes parcial en modo calendario)."""
+    if "eje" in panel.columns and len(panel):
+        return panel.drop_duplicates("orden").set_index("orden")["eje"].astype(str).to_dict()
+    return {}
+
+
 def growth_accounting(panel: pd.DataFrame, ordenes: list, marca_de: dict | None = None) -> pd.DataFrame:
     apm = _activos_por_mes(panel, ordenes)
+    ejes = _ejes_panel(panel)
     if marca_de is not None:
         apm = {o: {u for u in apm[o] if marca_de.get(u) is not None} for o in ordenes}
     first_seen = {}
@@ -584,7 +804,7 @@ def growth_accounting(panel: pd.DataFrame, ordenes: list, marca_de: dict | None 
         recur = cur & prev
         react = (cur - prev) - nuevos
         perdidos = prev - cur
-        rows.append({"orden": o, "eje": MES_ABR[o], "Nuevos": len(nuevos),
+        rows.append({"orden": o, "eje": ejes.get(o, etiqueta_mes(o)), "Nuevos": len(nuevos),
                      "Recurrentes": len(recur), "Reactivados": len(react),
                      "Total activos": len(cur), "Perdidos": len(perdidos)})
         prev = cur
@@ -602,6 +822,7 @@ def growth_accounting_marca(panel, ordenes) -> dict:
 
 def cohortes_retencion(panel, ordenes) -> pd.DataFrame:
     apm = _activos_por_mes(panel, ordenes)
+    ejes = _ejes_panel(panel)
     first_seen = {}
     for o in ordenes:
         for u in apm[o]:
@@ -612,7 +833,7 @@ def cohortes_retencion(panel, ordenes) -> pd.DataFrame:
     mat = []
     for c in ordenes:
         size = len(cohortes.get(c, set()))
-        fila = {"Cohorte": MES_ABR[c], "n": size}
+        fila = {"Cohorte": ejes.get(c, etiqueta_mes(c)), "n": size}
         for k, o in enumerate(ordenes):
             if o < c:
                 continue
@@ -673,6 +894,8 @@ def lift_les(periodos: list, panel: pd.DataFrame, ordenes: list) -> pd.DataFrame
 
 def serie_diaria_larga(d: dict, hist_serie=None) -> pd.DataFrame:
     """SLIDE 2A: serie diaria larga (histórico) + previous + current, con rolling y estacional."""
+    if hist_serie is None and "serie_anual_horas" in d:
+        hist_serie = d["serie_anual_horas"]
     if hist_serie is None:
         if USE_PREPARED:
             hist_serie = pd.read_parquet(os.path.join(PREPARED_DIR, "historico", "serie_larga_horas.parquet"))
@@ -867,7 +1090,13 @@ def cargar_roster() -> pd.DataFrame | None:
     """
     if USE_PREPARED:
         f = os.path.join(PREPARED_DIR, "roster.parquet")
-        return _leer_parquet(f) if os.path.exists(f) else None
+        if not os.path.exists(f):
+            return None
+        r = _leer_parquet(f)
+        if "Poblacion" not in r.columns:      # parquet anterior: Nivel "Mixto"
+            r["Nivel"] = r["Nivel"].astype(object).replace({"Mixto": DOCENTES})
+            r = _compactar(_poblacion(r))
+        return r
     for carpeta in (os.path.join(ROOT, "Nueva data"), CUR_PATH, HIST_DIR):
         files = glob.glob(os.path.join(carpeta, "Listado_de_usuarios*.csv"))
         if files:
@@ -875,13 +1104,8 @@ def cargar_roster() -> pd.DataFrame | None:
             df = limpiar_usuarios(df)
             df = df.rename(columns={"Curso": "Nivel",
                                     "Contenidos consumidos": "Nº de contenidos consumidos"})
-            df["Nivel"] = df["Nivel"].astype(str).str.strip().str.lower().map(
-                {"superior": "Superior", "mediosuperior": "Medio superior",
-                 "medio superior": "Medio superior", "mediasuperior": "Medio superior",
-                 "mediosuperior,superior": "Mixto", "licenciatura": "Superior",
-                 "licenciatura udg": "Superior", "bachillerato udg": "Medio superior"}
-            ).fillna("Sin dato")
-            return df
+            # "MedioSuperior,Superior" = Docentes (antes se rotulaba "Mixto").
+            return _poblacion(df)
     return None
 
 
@@ -933,10 +1157,17 @@ def embudo_usuarios(df_cpu: pd.DataFrame, roster: pd.DataFrame | None = None,
     """
     uh = df_cpu.groupby("Usuario", observed=True)["Horas de aprendizaje"].sum()
     filas = []
+    roster_omitido = False
     if roster is not None and not roster.empty:
         r = _filtrar_marca(roster, marcas)
-        filas.append(("Usuarios con licencia", int(r["Usuario"].nunique()),
-                      "roster acumulado (Listado de usuarios)"))
+        lic = int(r["Usuario"].nunique())
+        # Un roster con menos usuarios que los inscritos del periodo esta
+        # desactualizado para esa seleccion (p. ej. docentes dados de alta
+        # despues del export): como denominador daria porcentajes sobre 100%.
+        if lic >= len(uh):
+            filas.append(("Usuarios con licencia", lic, "roster acumulado (Listado de usuarios)"))
+        else:
+            roster_omitido = True
     filas += [
         ("Inscritos a alguna LE en el periodo", int(len(uh)), "snapshot usuario x LE"),
         ("Efectivos: consumo > 0 h", int((uh > 0).sum()), "snapshot usuario x LE"),
@@ -948,6 +1179,7 @@ def embudo_usuarios(df_cpu: pd.DataFrame, roster: pd.DataFrame | None = None,
     base = out["usuarios"].iloc[0]
     out["pct_base"] = out["usuarios"] / base * 100 if base else np.nan
     out["pct_paso"] = out["usuarios"] / out["usuarios"].shift(1) * 100
+    out.attrs["roster_omitido"] = roster_omitido
     return out
 
 
@@ -1251,6 +1483,11 @@ def cargar_base(cur_path=CUR_PATH, prev_path=PREV_PATH, hist_dir=HIST_DIR) -> di
             "generado": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
             "ejes": [p["eje"] for p in periodos],
             "corte": _fecha_corte(d["horas_cur"]),
+            # Modo calendario: la serie diaria llega mas alla del mes actual (el
+            # mes en curso queda parcial y marcado con * en los paneles).
+            "modo": d.get("modo", "ventanas"),
+            "corte_serie": _fecha_corte(d.get("serie_anual_horas", d["horas_cur"])),
+            "parciales": [etiqueta_mes(o) for o in d.get("parciales", [])],
         },
     }
 
@@ -1264,8 +1501,83 @@ def _fecha_corte(horas_df: pd.DataFrame) -> str:
     return f"{u.day:02d}-{MES_ABR[u.month]}-{u.year}"
 
 
-def computar(base: dict, marcas=None) -> dict:
-    """Calcula los agregados de cada sección para la selección de marcas dada."""
+def filtrar_poblacion(base: dict, poblacion=None) -> dict:
+    """Vista de la base restringida a una poblacion (Alumnos o Docentes).
+
+    Se filtra UNA vez en la base (snapshots actual/anterior, panel, periodos y
+    roster) y el resto del calculo no cambia. Las series diarias de plataforma
+    no traen el desglose, asi que se conservan tal cual: la UI no debe mostrarlas
+    como si fueran de la poblacion elegida."""
+    if not poblacion:
+        return base
+
+    def f(df):
+        if df is None or "Poblacion" not in df.columns:
+            return df
+        return df[df["Poblacion"] == poblacion]
+
+    d = dict(base["d"])
+    d["cpu_cur"], d["cpu_prev"] = f(d["cpu_cur"]), f(d["cpu_prev"])
+    out = dict(base)
+    out["d"] = d
+    out["periodos"] = [{**p, "df": f(p["df"])} for p in base["periodos"]]
+    out["panel"] = f(base["panel"])
+    out["roster"] = f(base.get("roster"))
+    return out
+
+
+def docentes_por_mes(periodos: list, marcas=None) -> pd.DataFrame:
+    """Serie mensual de la poblacion Docentes: en base, activos, horas, media y mediana."""
+    filas = []
+    for p in periodos:
+        df = _filtrar_marca(p["df"], marcas)
+        if "Poblacion" not in df.columns:
+            continue
+        doc = df[df["Poblacion"] == DOCENTES]
+        uh = doc.groupby("Usuario", observed=True)["Horas de aprendizaje"].sum()
+        act = uh[uh > 0]
+        tot = float(df["Horas de aprendizaje"].sum())
+        filas.append({"orden": p["orden"], "eje": p["eje"],
+                      "Docentes en base": int(len(uh)),
+                      "Docentes activos": int(len(act)),
+                      "Horas": float(uh.sum()),
+                      "Mediana min (activos)": float(act.median() * 60) if len(act) else np.nan,
+                      "Media min (activos)": float(act.mean() * 60) if len(act) else np.nan,
+                      "% horas de la plataforma": float(uh.sum() / tot * 100) if tot else np.nan})
+    return pd.DataFrame(filas)
+
+
+def docentes_resumen(periodos: list, d: dict, marcas=None) -> dict:
+    """Docentes por marca y cursos que consumen, en el periodo actual."""
+    cur = _filtrar_marca(d["cpu_cur"], marcas)
+    doc = cur[cur["Poblacion"] == DOCENTES] if "Poblacion" in cur.columns else cur.iloc[0:0]
+    uh = doc.groupby(["Universidad", "Usuario"], observed=True)["Horas de aprendizaje"].sum().reset_index()
+    marca = (uh.groupby("Universidad", observed=True)
+             .agg(en_base=("Usuario", "nunique"),
+                  activos=("Horas de aprendizaje", lambda s: int((s > 0).sum())),
+                  horas=("Horas de aprendizaje", "sum")).reset_index())
+    marca = _descat(marca)
+    marca = marca[marca["Universidad"].isin(MARCAS_4)]
+    c = doc[doc["Horas de aprendizaje"] > 0]
+    les = (c.groupby(["ID de la LE", "Nombre de la LE"], as_index=False, observed=True)
+           .agg(docentes=("Usuario", "nunique"), horas=("Horas de aprendizaje", "sum")))
+    les = _descat(les).sort_values(["docentes", "horas", "ID de la LE"],
+                                   ascending=[False, False, True]).reset_index(drop=True)
+    vistos = set()
+    for p in periodos:
+        df = p["df"]
+        if "Poblacion" in df.columns:
+            df = _filtrar_marca(df, marcas)
+            vistos |= set(df.loc[(df["Poblacion"] == DOCENTES) & (df["Horas de aprendizaje"] > 0),
+                                 "Usuario"].unique())
+    return {"por_marca": marca, "cursos": les, "activos_historicos": len(vistos)}
+
+
+def computar(base: dict, marcas=None, poblacion=None) -> dict:
+    """Calcula los agregados de cada sección para la selección de marcas y
+    poblacion (None = todas; "Alumnos" o "Docentes")."""
+    base_total = base
+    base = filtrar_poblacion(base, poblacion)
     d = base["d"]
     periodos = base["periodos"]
     ordenes = base["ordenes"]
@@ -1286,6 +1598,7 @@ def computar(base: dict, marcas=None) -> dict:
         # Sección 1 (marca-aware salvo KPIs de serie diaria)
         "panorama": panorama_kpis(d),               # global (serie diaria, sin marca)
         "panorama_marca": panorama_por_marca(d),    # ya es por marca
+        "panorama_snapshot": panorama_snapshot(cpu_cur, cpu_prev),
         "tendencias": tendencias_diarias(d),        # global (serie diaria)
         "segmentacion_global": segmentacion(cpu_cur),
         "segmentacion_marca": segmentacion_por_marca(d),
@@ -1305,7 +1618,8 @@ def computar(base: dict, marcas=None) -> dict:
         # ---- Bloque nuevo (sep-2026) ----
         "dist_cur": distribucion_horas(cpu_cur),
         "dist_prev": distribucion_horas(cpu_prev),
-        "embudo": embudo_usuarios(cpu_cur, roster, marcas),
+        "embudo": (_emb := embudo_usuarios(cpu_cur, roster, marcas)),
+        "embudo_roster_omitido": bool(_emb.attrs.get("roster_omitido", False)),
         "embudo_prev": embudo_usuarios(cpu_prev, roster, marcas),
         "act_vs_efe": activos_vs_efectivos(d),
         "cert_cur": certificacion(cpu_cur),
@@ -1319,6 +1633,10 @@ def computar(base: dict, marcas=None) -> dict:
         "ruta": ruta_master(cpu_cur),
         "ruta_prev": ruta_master(cpu_prev),
         "roster": roster_f,
+        # ---- Docentes (nov-2026): siempre sobre la base sin filtro de poblacion ----
+        "docentes_mes": docentes_por_mes(base_total["periodos"], marcas),
+        "docentes": docentes_resumen(base_total["periodos"], base_total["d"], marcas),
+        "poblacion": poblacion,
     }
 
 

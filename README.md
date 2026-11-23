@@ -44,6 +44,20 @@ git add data && git commit -m "datos <fecha>" && git push
 En local sin deployment, basta reemplazar los CSV y pulsar **🔄 Recargar datos**
 (no hace falta preparar parquet si borras/ignoras la carpeta `data/`).
 
+## Modo calendario: export anual (desde 23-Nov-2026)
+
+Si existe `../Pottencia Year/month_to_month/`, el pipeline trabaja en **meses calendario**: un snapshot por
+carpeta `<mes>_<aa>` y las 4 series diarias de `../Pottencia Year/`. Periodo actual = último mes completo de
+la serie, anterior = el previo; el mes en curso entra a los paneles marcado con `*`. Para actualizar: añadir
+la carpeta del mes nuevo, reemplazar las 4 series del export anual y correr `python preparar_datos.py`.
+Sin esa carpeta, todo sigue funcionando con current/previous como antes.
+
+**Población.** Docentes = Curso/Nivel exactamente `MedioSuperior,Superior` (columna `Poblacion`). El filtro
+Todos / Alumnos / Docentes arranca en **Alumnos** (`POBLACION_DEFAULT` en `app.py`): en oct-2026 el proveedor
+marcó 57k pares de docentes como terminados y certificados con 0 h, y mezclados inflaban el avance diez veces.
+«Todos» es la única opción que usa la serie diaria de plataforma en Panorama. La sección **Docentes** siempre
+mira la base completa.
+
 ## Actualización semanal (el flujo que pediste)
 
 1. Descarga del portal **Odilo BI** los CSV del periodo (los 4 del mes:
@@ -104,6 +118,7 @@ selección se perdería al volver a una sección con filtro. La sección activa 
 | Cursos | Cursos con más y menos usuarios con consumo, y top 5 de Δ horas | snapshot usuario×LE |
 | Puente y callejón | Lift de retención por LE (puente = lift > 0, callejón = lift < 0) | panel histórico |
 | Activación | Embudo de usuarios únicos, licencia a 5 h | roster + snapshot |
+| Docentes | Docentes por mes, horas, % de la plataforma, por marca y cursos | panel histórico |
 
 Activación es la única sección que no viene del deck.
 

@@ -2,8 +2,9 @@
 Dashboard PottencIA / ODILO: versión interactiva del deck mensual del comité.
 
 Reemplaza las presentaciones fijas (Datos PottencIA - <fecha>.pptx). Se actualiza
-solo con reemplazar los CSV que Santiago descarga del proveedor Odilo BI en las
-carpetas mnt/data/current, mnt/data/previous y datos_analisis_estrategico_2026.
+con los CSV que Santiago descarga del proveedor Odilo BI. Desde nov-2026 la fuente
+principal es el export anual `Pottencia Year/` (meses calendario); si no existe,
+usa mnt/data/current, mnt/data/previous y datos_analisis_estrategico_2026.
 
 Cada sección lleva solo título, fecha de corte, fuente y el bloque «Cómo leer
 esto» (qué muestra, cómo se calcula, definiciones). Nada interpretativo.
@@ -171,10 +172,10 @@ def load_base(_token: float):
 # max_entries=2: sin tope, pasear por las 4 marcas dejaba 5 resultados completos
 # vivos a la vez. Recalcular cuesta ~1s, la memoria en Cloud cuesta la app.
 @st.cache_data(show_spinner="Calculando agregados…", max_entries=2)
-def compute(_token: float, marcas_key: tuple):
+def compute(_token: float, marcas_key: tuple, poblacion: str | None = None):
     base = load_base(_token)
     marcas = list(marcas_key) if marcas_key else None
-    return pl.computar(base, marcas)
+    return pl.computar(base, marcas, poblacion)
 
 
 # ==================================================================
@@ -203,6 +204,12 @@ EJES = ", ".join(meta.get("ejes", []))
 st.sidebar.markdown(f"**Fecha de corte:** {CORTE}")
 st.sidebar.markdown(f"**Periodo actual:** {meta['cur_label']}")
 st.sidebar.markdown(f"**Periodo anterior:** {meta['prev_label']}")
+CALENDARIO = meta.get("modo") == "calendario"
+if CALENDARIO:
+    st.sidebar.markdown(f"**Serie diaria hasta:** {meta.get('corte_serie', CORTE)}")
+    if meta.get("parciales"):
+        st.sidebar.caption("Periodo = mes calendario. Actual = último mes completo. "
+                           f"Con * en los paneles: mes parcial ({', '.join(meta['parciales'])}).")
 
 # ==================================================================
 # Navegación y filtro (barra superior)
@@ -210,7 +217,8 @@ st.sidebar.markdown(f"**Periodo anterior:** {meta['prev_label']}")
 # Una sola fila, en el orden del deck del comité. Activación es la única
 # sección que no viene del deck.
 SECCIONES = ["Panorama", "Pulso", "Tendencias", "Intensidad", "Crecimiento",
-             "Retención", "Abandono", "Cursos", "Puente y callejón", "Activación"]
+             "Retención", "Abandono", "Cursos", "Puente y callejón", "Activación",
+             "Docentes"]
 TITULOS = {
     "Panorama": "Panorama del periodo",
     "Pulso": "Pulso de la plataforma",
@@ -222,6 +230,7 @@ TITULOS = {
     "Cursos": "Cursos con más y menos usuarios",
     "Puente y callejón": "Cursos puente y callejón",
     "Activación": "Embudo de activación",
+    "Docentes": "Docentes en la plataforma",
 }
 
 if "seccion_activa" not in st.session_state:
@@ -257,22 +266,53 @@ else:
 es_global = marca_sel == TODAS
 marcas_key = None if es_global else (marca_sel,)
 
-R = compute(st.session_state.reload_token, marcas_key)
+# Poblacion: Docentes = usuarios con Curso/Nivel "MedioSuperior,Superior" (el
+# valor combinado exacto). Igual que la marca, el control solo aparece donde
+# cambia los numeros: la serie diaria de plataforma no trae el desglose, y la
+# seccion Docentes ya es de esa poblacion.
+TODOS = "Todos"
+SIN_POBLACION = SIN_MARCA | {"Docentes"}
+# Por defecto se ven ALUMNOS. En oct-2026 el proveedor marco 57,172 pares de
+# docentes en 80-100% y con certificado sin una sola hora de consumo (alta
+# administrativa): mezclados, el % de pares en 80% o mas salia 20.4% contra
+# 1.8% real de alumnos. «Todos» sigue disponible y es el unico que usa la serie
+# diaria de plataforma en Panorama.
+POBLACION_DEFAULT = pl.ALUMNOS
+if "poblacion_activa" not in st.session_state:
+    st.session_state.poblacion_activa = POBLACION_DEFAULT
+if seccion in SIN_POBLACION:
+    pob_sel = TODOS
+else:
+    pob_sel = st.segmented_control(
+        "Población", [TODOS] + pl.POBLACIONES, default=st.session_state.poblacion_activa,
+        label_visibility="collapsed", key=f"pob_{seccion}")
+    if pob_sel is None:
+        pob_sel = POBLACION_DEFAULT
+    st.session_state.poblacion_activa = pob_sel
+poblacion = None if pob_sel == TODOS else pob_sel
+
+R = compute(st.session_state.reload_token, marcas_key, poblacion)
 
 etiqueta_marca = "todas las marcas" if es_global else marca_sel
+if poblacion:
+    etiqueta_marca += f" · {poblacion.lower()}"
 st.divider()
 
 
-def encabezado(fuente: str, periodo: str | None = None):
+def encabezado(fuente: str, periodo: str | None = None, corte: str | None = None):
     """Título + una línea de metadatos: corte, periodo, fuente y marca."""
     st.header(TITULOS[seccion])
     periodo = periodo or (f"Periodo actual {meta['cur_label']} · "
                           f"anterior {meta['prev_label']}")
     marca = "global, sin desglose por marca" if seccion in SIN_MARCA else etiqueta_marca
-    st.caption(f"Corte: {CORTE} · {periodo} · Fuente: {fuente} · {marca}")
+    st.caption(f"Corte: {corte or CORTE} · {periodo} · Fuente: {fuente} · {marca}")
 
 
 PERIODOS_PANEL = f"Periodos del panel: {EJES}"
+NOTA_PANEL = ("meses calendario; * = mes parcial (la exportación corta antes de fin de mes)"
+              if CALENDARIO else
+              "cada uno es un snapshot mensual o una ventana de export etiquetada por su "
+              "punto medio")
 
 
 def _opacidad(universidades, base=0.35):
@@ -289,7 +329,7 @@ if seccion == "Panorama":
     #   - Todas  -> serie diaria de plataforma (4 KPIs, incluye efectivos).
     #   - 1 marca -> snapshot usuario x LE de esa marca (3 KPIs).
     # Nunca se mezclan en la misma fila: los universos son distintos.
-    if es_global:
+    if es_global and not poblacion:
         encabezado("serie diaria de plataforma (KPIs) y snapshot usuario×LE (por marca)")
         pan = R["panorama"]
         glosario(
@@ -305,6 +345,21 @@ if seccion == "Panorama":
              "Serie diaria vs snapshot": "miden universos distintos (la serie diaria reporta "
                                          "~3x las horas del snapshot); sus valores no se suman "
                                          "ni se comparan entre sí."})
+    elif es_global:
+        # Una poblacion sin marca: KPIs del snapshot (la serie diaria no la desglosa).
+        encabezado("snapshot usuario×LE")
+        pan = R["panorama_snapshot"]
+        glosario(
+            f"Los KPIs de la población {poblacion.lower()}, su variación contra el periodo "
+            "anterior y la comparación por universidad.",
+            "Suma del **snapshot usuario×LE** de la población. Δ% = (actual − anterior) / "
+            "anterior. La serie diaria de plataforma no trae desglose por población.",
+            {"Docentes": "usuarios con Curso/Nivel «MedioSuperior,Superior» (el valor "
+                         "combinado exacto del proveedor).",
+             "Alumnos": "el resto de usuarios (Superior, Medio superior o sin dato).",
+             "Usuarios con consumo": "usuarios distintos con al menos un registro.",
+             "Valores de «Todos» vs población": "miden universos distintos (serie diaria "
+                                                "vs snapshot); no son comparables entre sí."})
     else:
         encabezado("snapshot usuario×LE")
         _fila = R["panorama_marca"]
@@ -383,7 +438,8 @@ if seccion == "Panorama":
 elif seccion == "Pulso":
     s = R["serie_larga"]
     encabezado("serie diaria de horas de plataforma",
-               periodo=f"Serie {s['fecha'].min():%d-%m-%Y} a {s['fecha'].max():%d-%m-%Y}")
+               periodo=f"Serie {s['fecha'].min():%d-%m-%Y} a {s['fecha'].max():%d-%m-%Y}",
+               corte=meta.get("corte_serie", CORTE))
     glosario(
         "La serie diaria de horas de aprendizaje de la plataforma desde el primer día disponible.",
         "Panel superior: media móvil de 7 días y tendencia de 28 días. Panel inferior: índice = "
@@ -406,8 +462,9 @@ elif seccion == "Pulso":
                              name="Horas/día (7d)"), row=1, col=1)
     fig.add_trace(go.Scatter(x=sp["fecha"], y=sp["r28"], line=dict(color=GRIS, width=1.5, dash="dash"),
                              name="Tendencia 28d"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=sp["fecha"], y=sp["idx_estacional"], line=dict(color="#CFC3E4", width=0.5),
-                             fill="tozeroy", name="Índice", showlegend=False), row=2, col=1)
+    # Barras y no area: el relleno "tozeroy" unia los huecos con una diagonal.
+    fig.add_trace(go.Bar(x=sp["fecha"], y=sp["idx_estacional"], marker_color="#CFC3E4",
+                         marker_line_width=0, name="Índice", showlegend=False), row=2, col=1)
     fig.add_hline(y=1, line=dict(color=GRIS, dash="dash"), row=2, col=1)
     for f, txt in [("2026-02-01", "Carga masiva")]:
         fdt = pd.to_datetime(f)
@@ -568,8 +625,7 @@ elif seccion == "Crecimiento":
          "Recurrentes": "activos en este periodo y en el anterior.",
          "Reactivados": "activos en algún periodo previo, pero no en el anterior.",
          "Perdidos": "activos en el periodo anterior y no en este (línea bajo cero).",
-         "Periodos del panel": f"{EJES}. Cada uno es un snapshot mensual o una ventana de "
-                               "export etiquetada por su punto medio."})
+         "Periodos del panel": f"{EJES}: {NOTA_PANEL}."})
     ga = R["growth"]
 
     fig = go.Figure()
@@ -611,7 +667,7 @@ elif seccion == "Retención":
         {"Cohorte": "usuarios cuya primera actividad cae en el mismo periodo.",
          "n": "tamaño de la cohorte (usuarios).",
          "+N": "N periodos después de la primera actividad, contados sobre la lista del panel.",
-         "Periodos del panel": f"{EJES}."})
+         "Periodos del panel": f"{EJES}: {NOTA_PANEL}."})
     coh = R["cohortes"]
     mcols = [c for c in coh.columns if c.startswith("m")]
 
@@ -813,7 +869,7 @@ elif seccion == "Puente y callejón":
          "Curso callejón": "lift negativo: sus consumidores vuelven por debajo de la base.",
          "Transición-usuario": "un usuario con consumo en el curso en un periodo, observado "
                                "en el periodo siguiente.",
-         "Periodos del panel": f"{EJES}."})
+         "Periodos del panel": f"{EJES}: {NOTA_PANEL}."})
 
     lift = R["lift_estrategico"]
     if lift.empty:
@@ -881,6 +937,10 @@ elif seccion == "Activación":
                                "sus cursos.",
          "Roster": "mismo denominador en los dos periodos (acumulado de vida)."})
 
+    if R.get("embudo_roster_omitido"):
+        st.caption("El roster de licencias tiene menos usuarios que los inscritos de esta "
+                   "selección (export anterior a su alta), así que no se usa como denominador: "
+                   "la base del embudo son los inscritos del periodo.")
     fig = go.Figure(go.Bar(
         x=emb["usuarios"], y=emb["etapa"], orientation="h", marker_color=AZUL,
         text=[f"{u:,.0f}  ({p:.1f}% de la base)" for u, p in zip(emb["usuarios"], emb["pct_base"])],
@@ -906,3 +966,98 @@ elif seccion == "Activación":
         _t = emb[["etapa", "usuarios", "pct_base", "pct_paso"]].copy()
         _t["usuarios_anterior"] = [_m.get(e, np.nan) for e in _t["etapa"]]
         st.dataframe(_t.round(1), use_container_width=True, hide_index=True)
+
+
+# ==================================================================
+# DOCENTES
+# ==================================================================
+elif seccion == "Docentes":
+    encabezado("panel histórico de snapshots usuario×LE",
+               periodo=f"{PERIODOS_PANEL} · periodo actual {meta['cur_label']}")
+    glosario(
+        "Docentes con registro y con consumo en cada periodo, sus horas, su peso en las horas "
+        "de la plataforma, el reparto por universidad y los cursos que consumen.",
+        "Docente = usuario cuyo Curso/Nivel en el export es exactamente «MedioSuperior,Superior». "
+        "Se suman las horas de cada docente en el periodo; activo = más de 0 h. La mediana y "
+        "la media se calculan sobre los docentes activos. % de horas = horas de docentes / "
+        "horas de todos los usuarios del snapshot del mismo periodo.",
+        {"Docentes": "Curso/Nivel = «MedioSuperior,Superior». No incluye a quien trae solo "
+                     "«Superior» ni solo «MedioSuperior».",
+         "En base": "docentes con al menos una fila usuario×LE en el periodo, aunque sea con 0 h.",
+         "Activos": "docentes con más de 0 h en el periodo.",
+         "Activos acumulados": "docentes distintos con más de 0 h en algún periodo del panel.",
+         "Periodos del panel": f"{EJES}: {NOTA_PANEL}."})
+    dm = R["docentes_mes"]
+    dr = R["docentes"]
+    if dm.empty or dm["Docentes en base"].sum() == 0:
+        st.info("No hay docentes en esta selección.")
+    else:
+        _ult = dm[dm["orden"] == dm["orden"].max()].iloc[0]
+        _dmc = dm.set_index("eje")
+        _cur_eje = [e for e in dm["eje"] if e.rstrip("*") == meta["cur_label"].split(" ")[0]]
+        _fila = _dmc.loc[_cur_eje[0]] if _cur_eje else _ult
+        k = st.columns(4)
+        k[0].metric("Docentes activos (periodo actual)", fmt(_fila["Docentes activos"]),
+                    f"de {int(_fila['Docentes en base']):,} en base", delta_color="off")
+        k[1].metric("Horas de docentes (periodo actual)", fmt(_fila["Horas"], 0),
+                    f"{_fila['% horas de la plataforma']:.1f}% de la plataforma",
+                    delta_color="off")
+        k[2].metric("Mediana por docente activo", f"{_fila['Mediana min (activos)']:.0f} min",
+                    f"media {_fila['Media min (activos)']:.0f} min", delta_color="off")
+        k[3].metric("Docentes activos acumulados", fmt(dr["activos_historicos"]))
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(name="En base", x=dm["eje"], y=dm["Docentes en base"],
+                             marker_color=GRIS_PREV))
+        fig.add_trace(go.Bar(name="Activos (más de 0 h)", x=dm["eje"], y=dm["Docentes activos"],
+                             marker_color=AZUL))
+        fig.update_layout(barmode="group", title="Docentes por periodo",
+                          yaxis_title="Docentes", bargap=0.3)
+        fig.update_yaxes(rangemode="tozero")
+        show(fig, height=380)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            f2 = go.Figure(go.Bar(x=dm["eje"], y=dm["Horas"], marker_color=AZUL,
+                                  text=[f"{v:,.0f}" for v in dm["Horas"]],
+                                  textposition="outside"))
+            f2.update_layout(title="Horas de docentes por periodo", yaxis_title="Horas")
+            f2.update_yaxes(rangemode="tozero")
+            show(f2, height=340)
+        with c2:
+            f3 = go.Figure(go.Scatter(x=dm["eje"], y=dm["% horas de la plataforma"],
+                                      mode="lines+markers", line=dict(color=AZUL, width=2)))
+            f3.update_layout(title="% de las horas de la plataforma", yaxis_title="%")
+            f3.update_yaxes(rangemode="tozero")
+            show(f3, height=340)
+
+        st.subheader("Por marca (periodo actual)")
+        pm = dr["por_marca"]
+        if not pm.empty:
+            _op = _opacidad(pm["Universidad"])
+            f4 = make_subplots(rows=1, cols=2, subplot_titles=["Docentes activos", "Horas"])
+            f4.add_trace(go.Bar(x=pm["Universidad"], y=pm["activos"],
+                                marker=dict(color=AZUL, opacity=_op), showlegend=False), row=1, col=1)
+            f4.add_trace(go.Bar(x=pm["Universidad"], y=pm["horas"],
+                                marker=dict(color=AZUL, opacity=_op), showlegend=False), row=1, col=2)
+            f4.update_yaxes(rangemode="tozero")
+            show(f4, height=320)
+
+        st.subheader("Cursos con más docentes (periodo actual)")
+        cl = dr["cursos"]
+        if cl.empty:
+            st.info("Sin consumo de docentes en el periodo actual.")
+        else:
+            top = cl.head(10).iloc[::-1]
+            f5 = go.Figure(go.Bar(
+                x=top["docentes"], y=[corto(x) for x in top["Nombre de la LE"]], orientation="h",
+                marker_color=AZUL, text=[fmt(v) for v in top["docentes"]], textposition="outside",
+                customdata=list(zip(top["Nombre de la LE"], top["horas"])),
+                hovertemplate="%{customdata[0]}<br>%{x:,.0f} docentes<br>"
+                              "%{customdata[1]:,.1f} h<extra></extra>"))
+            f5.update_layout(xaxis_title="Docentes con consumo",
+                             xaxis_range=[0, float(top["docentes"].max()) * 1.25])
+            show(f5, height=120 + 32 * len(top))
+        with st.expander("Ver tabla por periodo"):
+            st.dataframe(dm.drop(columns=["orden"]).round(1), use_container_width=True,
+                         hide_index=True)
