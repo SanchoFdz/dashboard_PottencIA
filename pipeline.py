@@ -70,6 +70,9 @@ TRAMO_MAP = {"Entre 0% y 20%": 10, "Entre 20% y 50%": 35,
              "Entre 50% y 80%": 65, "Entre 80% y 100%": 90}
 # "Corrección doble conteo" heredada del deck v2 (ver FABLE-5-MAP §2.2b).
 FACTOR_EFECTIVOS = 2
+# Arranque real de la plataforma (primer dia con mas de 100 usuarios activos).
+# Antes hay 1-20 usuarios al dia de pruebas: no sirve como base interanual.
+ARRANQUE = pd.Timestamp("2025-11-11")
 MIN_CONS_LE = 40   # consumidores mínimos de una LE para entrar al ranking gancho/callejón
 
 COL_USU = "Nº Usuarios efectivos (DISTINCT_COUNT)"
@@ -910,10 +913,49 @@ def serie_diaria_larga(d: dict, hist_serie=None) -> pd.DataFrame:
         serie = pd.concat([serie, e[["fecha", "horas"]]], ignore_index=True)
     serie = (serie.dropna(subset=["fecha"]).sort_values("fecha")
              .drop_duplicates(subset="fecha", keep="last").reset_index(drop=True))
+    if d.get("modo") == "calendario":
+        # El export anual es una sola descarga continua: un dia ausente es un dia
+        # sin actividad (04-Oct, 11-Oct y 09-Nov-2025, antes del arranque), no un
+        # hueco de exportacion. Se rellena con 0 para que la linea no se corte.
+        cal = pd.DataFrame({"fecha": pd.date_range(serie["fecha"].min(), serie["fecha"].max(), freq="D")})
+        serie = cal.merge(serie, on="fecha", how="left").fillna({"horas": 0.0})
     serie["r7"] = serie["horas"].rolling(7, min_periods=1).mean()
     serie["r28"] = serie["horas"].rolling(28, min_periods=7, center=True).mean()
     serie["idx_estacional"] = serie["horas"] / serie["r28"]
+    # Comparacion interanual: media 7d del mismo dia de la semana un anno antes
+    # (364 dias = 52 semanas exactas, asi lunes se compara con lunes).
+    prev = serie.set_index("fecha")["r7"]
+    serie["r7_anno_ant"] = serie["fecha"].map(
+        lambda f: prev.get(f - pd.Timedelta(days=364), np.nan)
+        if f - pd.Timedelta(days=364) >= ARRANQUE else np.nan)
     return serie
+
+
+def interanual(serie: pd.DataFrame, dias: int = 364) -> pd.DataFrame:
+    """Horas de los mismos dias en el anno actual y el anterior, por mes calendario.
+
+    Solo cuenta dias con dato en los dos annos (fecha y fecha - 364 d), sin el ultimo dia
+    del export, asi un mes
+    parcial o el arranque de nov-2025 se comparan contra el mismo tramo de dias.
+    El anno base empieza en ARRANQUE: los dias de prueba de oct-2025 no cuentan."""
+    s = serie.set_index("fecha")["horas"]
+    # El ultimo dia de cada export es el dia de la descarga y llega parcial
+    # (02-Nov y 17-Nov-2026 ya documentados): no entra en la comparacion.
+    s_cmp = s.iloc[:-1]
+    filas = []
+    for f, h in s_cmp.items():
+        f0 = f - pd.Timedelta(days=dias)
+        if f0 >= ARRANQUE and f0 in s.index:
+            filas.append({"orden": _orden_de_fecha(f), "fecha": f, "horas": h, "horas_ant": s.loc[f0]})
+    if not filas:
+        return pd.DataFrame(columns=["eje", "dias", "desde", "hasta", "horas", "horas_ant", "delta_pct"])
+    df = pd.DataFrame(filas)
+    out = (df.groupby("orden").agg(dias=("fecha", "size"), desde=("fecha", "min"),
+                                   hasta=("fecha", "max"), horas=("horas", "sum"),
+                                   horas_ant=("horas_ant", "sum")).reset_index())
+    out["eje"] = out["orden"].map(etiqueta_mes)
+    out["delta_pct"] = (out["horas"] / out["horas_ant"] - 1) * 100
+    return out[["eje", "dias", "desde", "hasta", "horas", "horas_ant", "delta_pct"]]
 
 
 # ==================================================================
@@ -1573,6 +1615,66 @@ def docentes_resumen(periodos: list, d: dict, marcas=None) -> dict:
     return {"por_marca": marca, "cursos": les, "activos_historicos": len(vistos)}
 
 
+def docentes_anual(periodos: list, marcas=None, top: int = 15) -> dict:
+    """Docentes sobre TODO el panel: penetracion y horas por marca, ranking de
+    docentes por horas y cursos mas consumidos.
+
+    En modo preparado el Usuario llega anonimizado (hash), asi que el ranking
+    identifica al docente por marca y posicion, no por correo."""
+    frames = []
+    for p in periodos:
+        df = p["df"]
+        if "Poblacion" not in df.columns:
+            continue
+        df = _filtrar_marca(df, marcas)
+        doc = df[df["Poblacion"] == DOCENTES]
+        if len(doc):
+            frames.append(doc.assign(eje=p["eje"])[["Usuario", "Universidad", "ID de la LE",
+                                                    "Nombre de la LE", "Horas de aprendizaje", "eje"]])
+    vacio = {"por_marca": pd.DataFrame(), "ranking": pd.DataFrame(), "cursos": pd.DataFrame(),
+             "resumen": {}}
+    if not frames:
+        return vacio
+    a = pd.concat(frames, ignore_index=True)
+    a["Universidad"] = a["Universidad"].astype(str)
+    a["Usuario"] = a["Usuario"].astype(str)
+    c = a[a["Horas de aprendizaje"] > 0]
+    base_m = a.groupby("Universidad")["Usuario"].nunique()
+    uh = c.groupby(["Universidad", "Usuario"])["Horas de aprendizaje"].sum().reset_index()
+    pm = (uh.groupby("Universidad")
+          .agg(activos=("Usuario", "nunique"), horas=("Horas de aprendizaje", "sum"),
+               mediana_min=("Horas de aprendizaje", lambda s: float(s.median() * 60))).reset_index())
+    pm["en_base"] = pm["Universidad"].map(base_m)
+    pm = (pd.DataFrame({"Universidad": base_m.index}).merge(pm.drop(columns="en_base"), how="left")
+          .assign(en_base=lambda x: x["Universidad"].map(base_m)).fillna(
+              {"activos": 0, "horas": 0.0}))
+    pm["pct_activos"] = pm["activos"] / pm["en_base"] * 100
+    pm["horas_por_activo"] = pm["horas"] / pm["activos"].where(pm["activos"] > 0)
+    pm["pct_horas"] = pm["horas"] / pm["horas"].sum() * 100 if pm["horas"].sum() else np.nan
+    pm = pm[pm["Universidad"].isin(MARCAS_4)].sort_values("activos", ascending=False).reset_index(drop=True)
+
+    rk = (c.groupby(["Usuario", "Universidad"])
+          .agg(horas=("Horas de aprendizaje", "sum"), cursos=("ID de la LE", "nunique"),
+               meses=("eje", "nunique")).reset_index()
+          .sort_values(["horas", "Usuario"], ascending=[False, True]).reset_index(drop=True))
+    rk["rank"] = np.arange(1, len(rk) + 1)
+    rk["Docente"] = [f"#{r} · {u}" for r, u in zip(rk["rank"], rk["Universidad"])]
+    tot = rk["horas"].sum()
+    n10 = max(1, int(round(len(rk) * 0.10)))
+    resumen = {"en_base": int(a["Usuario"].nunique()), "activos": int(len(rk)),
+               "horas": float(tot),
+               "mediana_min": float(rk["horas"].median() * 60) if len(rk) else np.nan,
+               "media_min": float(rk["horas"].mean() * 60) if len(rk) else np.nan,
+               "top10_share": float(rk["horas"].head(n10).sum() / tot * 100) if tot else np.nan,
+               "ejes": list(dict.fromkeys(a["eje"]))}
+    les = (c.groupby(["ID de la LE", "Nombre de la LE"])
+           .agg(docentes=("Usuario", "nunique"), horas=("Horas de aprendizaje", "sum")).reset_index()
+           .sort_values(["docentes", "horas", "ID de la LE"], ascending=[False, False, True])
+           .reset_index(drop=True))
+    les["pct_docentes"] = les["docentes"] / max(len(rk), 1) * 100
+    return {"por_marca": pm, "ranking": rk.head(top), "cursos": les, "resumen": resumen}
+
+
 def computar(base: dict, marcas=None, poblacion=None) -> dict:
     """Calcula los agregados de cada sección para la selección de marcas y
     poblacion (None = todas; "Alumnos" o "Docentes")."""
@@ -1636,6 +1738,8 @@ def computar(base: dict, marcas=None, poblacion=None) -> dict:
         # ---- Docentes (nov-2026): siempre sobre la base sin filtro de poblacion ----
         "docentes_mes": docentes_por_mes(base_total["periodos"], marcas),
         "docentes": docentes_resumen(base_total["periodos"], base_total["d"], marcas),
+        "docentes_anual": docentes_anual(base_total["periodos"], marcas),
+        "interanual": interanual(base["serie_larga"]),
         "poblacion": poblacion,
     }
 

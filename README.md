@@ -233,6 +233,11 @@ verificando que el hash no cambiara ni un dígito.
 - **Los conteos de la serie diaria son usuario-día, no personas.** «Activos» y «efectivos»
   suman conteos diarios: nunca ponerlos en un embudo de personas ni compararlos con los
   usuarios únicos del snapshot.
+- **Interanual = mismo día de la semana, 364 días antes**, y solo desde el arranque
+  (`ARRANQUE`, 11-Nov-2025): octubre de 2025 eran pruebas y daría variaciones de miles de por
+  ciento. El último día del export (parcial) no entra.
+- **El ranking de docentes no muestra correos**: el tablero publicado guarda usuarios
+  anonimizados; se identifica por posición y marca.
 - **`Certificado` es resultado, no palanca.** Es del par (usuario, LE), no del curso: 99 de
   112 LEs tienen filas `Si` y `No`. No presentarlo como una característica del catálogo.
 

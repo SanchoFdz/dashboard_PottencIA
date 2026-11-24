@@ -448,7 +448,10 @@ elif seccion == "Pulso":
         {"Media móvil 7d": "promedio del día y los 6 anteriores con dato.",
          "Tendencia 28d": "media móvil centrada de 28 días.",
          "Índice vs tendencia": "horas del día / tendencia 28d. 1 = igual a la tendencia.",
-         "Carga masiva": "alta masiva de usuarios (Feb-2026), marcada en la serie."})
+         "Carga masiva": "alta masiva de usuarios (Feb-2026), marcada en la serie.",
+         "Año anterior": "media 7d del mismo día de la semana 52 semanas antes (364 días). "
+                         "Aparece desde el 10-Nov-2026: antes del 11-Nov-2025 la plataforma no "
+                         "había arrancado."})
 
     # Se reindexa a calendario diario para que los dias ausentes en las
     # exportaciones se dibujen como hueco y no como una recta que los une.
@@ -462,6 +465,12 @@ elif seccion == "Pulso":
                              name="Horas/día (7d)"), row=1, col=1)
     fig.add_trace(go.Scatter(x=sp["fecha"], y=sp["r28"], line=dict(color=GRIS, width=1.5, dash="dash"),
                              name="Tendencia 28d"), row=1, col=1)
+    if "r7_anno_ant" in sp.columns and sp["r7_anno_ant"].notna().any():
+        fig.add_trace(go.Scatter(x=sp["fecha"], y=sp["r7_anno_ant"],
+                                 line=dict(color=GRIS_PREV, width=2),
+                                 name="Mismo día, año anterior (7d)",
+                                 hovertemplate="%{x|%d-%m-%Y}<br>Año anterior (7d): %{y:,.0f} h"
+                                               "<extra></extra>"), row=1, col=1)
     # Barras y no area: el relleno "tozeroy" unia los huecos con una diagonal.
     fig.add_trace(go.Bar(x=sp["fecha"], y=sp["idx_estacional"], marker_color="#CFC3E4",
                          marker_line_width=0, name="Índice", showlegend=False), row=2, col=1)
@@ -475,6 +484,21 @@ elif seccion == "Pulso":
                                showarrow=False, font=dict(size=9, color=GRIS),
                                xanchor="left", yanchor="top", row=1, col=1)
     show(fig, height=600)
+
+    ia = R.get("interanual")
+    if ia is not None and len(ia):
+        st.subheader("Contra el año anterior")
+        st.caption("Horas de los mismos días de la semana un año antes; sin el último día del "
+                   "export, que llega parcial. Fuente: serie diaria de plataforma (alumnos y "
+                   "docentes).")
+        cols = st.columns(min(len(ia), 4))
+        for col, (_, r) in zip(cols, ia.tail(4).iterrows()):
+            col.metric(f"{r['eje'].rstrip('*')}: {r['desde']:%d}-{r['hasta']:%d} ({int(r['dias'])} días)",
+                       f"{fmt(r['horas'])} h", delta_txt(r["delta_pct"], "% vs año anterior"))
+        with st.expander("Ver tabla"):
+            _t = ia.copy()
+            _t["desde"], _t["hasta"] = _t["desde"].dt.strftime("%d-%m-%Y"), _t["hasta"].dt.strftime("%d-%m-%Y")
+            st.dataframe(_t.round(1), use_container_width=True, hide_index=True)
 
 
 # ==================================================================
@@ -976,7 +1000,8 @@ elif seccion == "Docentes":
                periodo=f"{PERIODOS_PANEL} · periodo actual {meta['cur_label']}")
     glosario(
         "Docentes con registro y con consumo en cada periodo, sus horas, su peso en las horas "
-        "de la plataforma, el reparto por universidad y los cursos que consumen.",
+        "de la plataforma, el reparto por universidad y los cursos que consumen; al final, la "
+        "vista acumulada de todo el panel con los docentes que más lo usan.",
         "Docente = usuario cuyo Curso/Nivel en el export es exactamente «MedioSuperior,Superior». "
         "Se suman las horas de cada docente en el periodo; activo = más de 0 h. La mediana y "
         "la media se calculan sobre los docentes activos. % de horas = horas de docentes / "
@@ -1061,3 +1086,73 @@ elif seccion == "Docentes":
         with st.expander("Ver tabla por periodo"):
             st.dataframe(dm.drop(columns=["orden"]).round(1), use_container_width=True,
                          hide_index=True)
+
+        # ---- Vista anual (todo el panel) ----
+        da = R.get("docentes_anual") or {}
+        rs = da.get("resumen") or {}
+        if rs.get("activos"):
+            st.subheader("En todo el panel")
+            st.caption(f"Docentes acumulados en {', '.join(rs['ejes'])}. Horas sumadas de todos "
+                       "los periodos; activo = más de 0 h en algún periodo.")
+            k = st.columns(4)
+            k[0].metric("Docentes activos", fmt(rs["activos"]), f"de {rs['en_base']:,} en base",
+                        delta_color="off")
+            k[1].metric("Horas de docentes", fmt(rs["horas"], 0))
+            k[2].metric("Mediana por docente activo", f"{rs['mediana_min']:.0f} min",
+                        f"media {rs['media_min']:.0f} min", delta_color="off")
+            k[3].metric("Horas del 10% más intensivo", f"{rs['top10_share']:.0f}%",
+                        "del total de horas docentes", delta_color="off")
+
+            pma = da["por_marca"]
+            if not pma.empty:
+                _op = _opacidad(pma["Universidad"])
+                f6 = make_subplots(rows=1, cols=3, subplot_titles=[
+                    "% de docentes en base con consumo", "Horas", "Horas por docente activo"])
+                for i, (col_, fmt_) in enumerate([("pct_activos", "{:.0f}%"), ("horas", "{:,.0f}"),
+                                                  ("horas_por_activo", "{:.1f}")], start=1):
+                    f6.add_trace(go.Bar(x=pma["Universidad"], y=pma[col_],
+                                        marker=dict(color=AZUL, opacity=_op), showlegend=False,
+                                        text=[fmt_.format(v) for v in pma[col_]],
+                                        textposition="outside",
+                                        customdata=list(zip(pma["en_base"], pma["activos"])),
+                                        hovertemplate="%{x}<br>%{y:,.1f}<br>En base %{customdata[0]:,.0f}"
+                                                      " · activos %{customdata[1]:,.0f}<extra></extra>"),
+                                 row=1, col=i)
+                    f6.update_yaxes(rangemode="tozero", range=[0, float(pma[col_].max()) * 1.25],
+                                    row=1, col=i)
+                f6.update_layout(title="Por marca, todo el panel")
+                show(f6, height=340)
+
+            c3, c4 = st.columns(2)
+            with c3:
+                rk = da["ranking"].head(10).iloc[::-1]
+                f7 = go.Figure(go.Bar(
+                    x=rk["horas"], y=rk["Docente"], orientation="h", marker_color=AZUL,
+                    text=[f"{v:,.1f} h" for v in rk["horas"]], textposition="outside",
+                    customdata=list(zip(rk["cursos"], rk["meses"])),
+                    hovertemplate="%{y}<br>%{x:,.1f} h<br>%{customdata[0]} cursos · "
+                                  "%{customdata[1]} periodos con consumo<extra></extra>"))
+                f7.update_layout(title="Docentes con más horas", xaxis_title="Horas",
+                                 xaxis_range=[0, float(rk["horas"].max()) * 1.3])
+                show(f7, height=120 + 32 * len(rk))
+            with c4:
+                cl2 = da["cursos"].head(10).iloc[::-1]
+                f8 = go.Figure(go.Bar(
+                    x=cl2["docentes"], y=[corto(x, 38) for x in cl2["Nombre de la LE"]],
+                    orientation="h", marker_color=AZUL,
+                    text=[f"{v:,.0f}" for v in cl2["docentes"]], textposition="outside",
+                    customdata=list(zip(cl2["Nombre de la LE"], cl2["horas"], cl2["pct_docentes"])),
+                    hovertemplate="%{customdata[0]}<br>%{x:,.0f} docentes "
+                                  "(%{customdata[2]:.0f}% de los activos)<br>"
+                                  "%{customdata[1]:,.1f} h<extra></extra>"))
+                f8.update_layout(title="Cursos con más docentes", xaxis_title="Docentes con consumo",
+                                 xaxis_range=[0, float(cl2["docentes"].max()) * 1.3])
+                show(f8, height=120 + 32 * len(cl2))
+            st.caption("El ranking identifica al docente por posición y marca: el tablero "
+                       "publicado no guarda correos (se anonimizan en preparar_datos.py).")
+            with st.expander("Ver tablas"):
+                st.dataframe(pma.round(1), use_container_width=True, hide_index=True)
+                st.dataframe(da["ranking"][["Docente", "horas", "cursos", "meses"]].round(1),
+                             use_container_width=True, hide_index=True)
+                st.dataframe(da["cursos"][["Nombre de la LE", "docentes", "pct_docentes", "horas"]]
+                             .round(1), use_container_width=True, hide_index=True)
