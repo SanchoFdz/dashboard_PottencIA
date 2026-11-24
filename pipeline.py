@@ -1569,8 +1569,15 @@ def filtrar_poblacion(base: dict, poblacion=None) -> dict:
 
 
 def docentes_por_mes(periodos: list, marcas=None) -> pd.DataFrame:
-    """Serie mensual de la poblacion Docentes: en base, activos, horas, media y mediana."""
+    """Serie mensual de la poblacion Docentes: en el export, nuevos, activos, horas,
+    media y mediana.
+
+    «Docentes en base» = docentes con al menos una fila usuario×LE en el export del
+    mes (asignacion o actividad), aunque sea con 0 h. NO es «altas del mes»: un
+    docente asignado aparece mes tras mes. «Nuevos en el export» = primera vez que
+    aparece en el panel; «Ya vistos» = aparecio en algun mes anterior."""
     filas = []
+    vistos = set()
     for p in periodos:
         df = _filtrar_marca(p["df"], marcas)
         if "Poblacion" not in df.columns:
@@ -1579,8 +1586,13 @@ def docentes_por_mes(periodos: list, marcas=None) -> pd.DataFrame:
         uh = doc.groupby("Usuario", observed=True)["Horas de aprendizaje"].sum()
         act = uh[uh > 0]
         tot = float(df["Horas de aprendizaje"].sum())
+        u = set(uh.index.astype(str))
+        nuevos = len(u - vistos)
+        vistos |= u
         filas.append({"orden": p["orden"], "eje": p["eje"],
                       "Docentes en base": int(len(uh)),
+                      "Nuevos en el export": int(nuevos),
+                      "Ya vistos": int(len(uh) - nuevos),
                       "Docentes activos": int(len(act)),
                       "Horas": float(uh.sum()),
                       "Mediana min (activos)": float(act.median() * 60) if len(act) else np.nan,
@@ -1658,7 +1670,10 @@ def docentes_anual(periodos: list, marcas=None, top: int = 15) -> dict:
                meses=("eje", "nunique")).reset_index()
           .sort_values(["horas", "Usuario"], ascending=[False, True]).reset_index(drop=True))
     rk["rank"] = np.arange(1, len(rk) + 1)
-    rk["Docente"] = [f"#{r} · {u}" for r, u in zip(rk["rank"], rk["Universidad"])]
+    # Cada barra es una persona distinta: se muestra un codigo corto y estable del
+    # usuario anonimizado (D-4a58) para que no se lea como «marca repetida».
+    rk["Docente"] = [f"{r}. {u} · D-{str(us).split('_')[-1][:4]}"
+                     for r, u, us in zip(rk["rank"], rk["Universidad"], rk["Usuario"])]
     tot = rk["horas"].sum()
     n10 = max(1, int(round(len(rk) * 0.10)))
     resumen = {"en_base": int(a["Usuario"].nunique()), "activos": int(len(rk)),

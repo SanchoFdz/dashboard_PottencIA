@@ -1008,7 +1008,11 @@ elif seccion == "Docentes":
         "horas de todos los usuarios del snapshot del mismo periodo.",
         {"Docentes": "Curso/Nivel = «MedioSuperior,Superior». No incluye a quien trae solo "
                      "«Superior» ni solo «MedioSuperior».",
-         "En base": "docentes con al menos una fila usuario×LE en el periodo, aunque sea con 0 h.",
+         "En el export": "docentes con al menos una fila usuario×LE en el periodo (asignación o "
+                         "actividad), aunque sea con 0 h. No son altas del mes: un docente asignado "
+                         "aparece mes tras mes.",
+         "Nuevos": "docentes que aparecen en el export por primera vez en ese periodo.",
+         "Ya vistos": "docentes que ya habían aparecido en algún periodo anterior.",
          "Activos": "docentes con más de 0 h en el periodo.",
          "Activos acumulados": "docentes distintos con más de 0 h en algún periodo del panel.",
          "Periodos del panel": f"{EJES}: {NOTA_PANEL}."})
@@ -1023,7 +1027,7 @@ elif seccion == "Docentes":
         _fila = _dmc.loc[_cur_eje[0]] if _cur_eje else _ult
         k = st.columns(4)
         k[0].metric("Docentes activos (periodo actual)", fmt(_fila["Docentes activos"]),
-                    f"de {int(_fila['Docentes en base']):,} en base", delta_color="off")
+                    f"de {int(_fila['Docentes en base']):,} en el export", delta_color="off")
         k[1].metric("Horas de docentes (periodo actual)", fmt(_fila["Horas"], 0),
                     f"{_fila['% horas de la plataforma']:.1f}% de la plataforma",
                     delta_color="off")
@@ -1031,11 +1035,15 @@ elif seccion == "Docentes":
                     f"media {_fila['Media min (activos)']:.0f} min", delta_color="off")
         k[3].metric("Docentes activos acumulados", fmt(dr["activos_historicos"]))
 
+        # En el export = nuevos + ya vistos (apilados); activos en barra aparte.
         fig = go.Figure()
-        fig.add_trace(go.Bar(name="En base", x=dm["eje"], y=dm["Docentes en base"],
-                             marker_color=GRIS_PREV))
+        fig.add_trace(go.Bar(name="En el export: nuevos", x=dm["eje"], y=dm["Nuevos en el export"],
+                             marker_color=GRIS, offsetgroup="export"))
+        fig.add_trace(go.Bar(name="En el export: ya vistos", x=dm["eje"], y=dm["Ya vistos"],
+                             marker_color=GRIS_PREV, offsetgroup="export",
+                             base=dm["Nuevos en el export"]))
         fig.add_trace(go.Bar(name="Activos (más de 0 h)", x=dm["eje"], y=dm["Docentes activos"],
-                             marker_color=AZUL))
+                             marker_color=AZUL, offsetgroup="activos"))
         fig.update_layout(barmode="group", title="Docentes por periodo",
                           yaxis_title="Docentes", bargap=0.3)
         fig.update_yaxes(rangemode="tozero")
@@ -1095,7 +1103,7 @@ elif seccion == "Docentes":
             st.caption(f"Docentes acumulados en {', '.join(rs['ejes'])}. Horas sumadas de todos "
                        "los periodos; activo = más de 0 h en algún periodo.")
             k = st.columns(4)
-            k[0].metric("Docentes activos", fmt(rs["activos"]), f"de {rs['en_base']:,} en base",
+            k[0].metric("Docentes activos", fmt(rs["activos"]), f"de {rs['en_base']:,} vistos en el export",
                         delta_color="off")
             k[1].metric("Horas de docentes", fmt(rs["horas"], 0))
             k[2].metric("Mediana por docente activo", f"{rs['mediana_min']:.0f} min",
@@ -1107,7 +1115,7 @@ elif seccion == "Docentes":
             if not pma.empty:
                 _op = _opacidad(pma["Universidad"])
                 f6 = make_subplots(rows=1, cols=3, subplot_titles=[
-                    "% de docentes en base con consumo", "Horas", "Horas por docente activo"])
+                    "% de docentes del export con consumo", "Horas", "Horas por docente activo"])
                 for i, (col_, fmt_) in enumerate([("pct_activos", "{:.0f}%"), ("horas", "{:,.0f}"),
                                                   ("horas_por_activo", "{:.1f}")], start=1):
                     f6.add_trace(go.Bar(x=pma["Universidad"], y=pma[col_],
@@ -1115,7 +1123,7 @@ elif seccion == "Docentes":
                                         text=[fmt_.format(v) for v in pma[col_]],
                                         textposition="outside",
                                         customdata=list(zip(pma["en_base"], pma["activos"])),
-                                        hovertemplate="%{x}<br>%{y:,.1f}<br>En base %{customdata[0]:,.0f}"
+                                        hovertemplate="%{x}<br>%{y:,.1f}<br>En el export %{customdata[0]:,.0f}"
                                                       " · activos %{customdata[1]:,.0f}<extra></extra>"),
                                  row=1, col=i)
                     f6.update_yaxes(rangemode="tozero", range=[0, float(pma[col_].max()) * 1.25],
@@ -1132,7 +1140,8 @@ elif seccion == "Docentes":
                     customdata=list(zip(rk["cursos"], rk["meses"])),
                     hovertemplate="%{y}<br>%{x:,.1f} h<br>%{customdata[0]} cursos · "
                                   "%{customdata[1]} periodos con consumo<extra></extra>"))
-                f7.update_layout(title="Docentes con más horas", xaxis_title="Horas",
+                f7.update_layout(title="Docentes con más horas (cada barra es un docente)",
+                                 xaxis_title="Horas",
                                  xaxis_range=[0, float(rk["horas"].max()) * 1.3])
                 show(f7, height=120 + 32 * len(rk))
             with c4:
@@ -1148,8 +1157,9 @@ elif seccion == "Docentes":
                 f8.update_layout(title="Cursos con más docentes", xaxis_title="Docentes con consumo",
                                  xaxis_range=[0, float(cl2["docentes"].max()) * 1.3])
                 show(f8, height=120 + 32 * len(cl2))
-            st.caption("El ranking identifica al docente por posición y marca: el tablero "
-                       "publicado no guarda correos (se anonimizan en preparar_datos.py).")
+            st.caption("Cada barra es un docente distinto: posición, marca y un código anónimo "
+                       "estable (D-xxxx). El tablero publicado no guarda correos (se anonimizan "
+                       "en preparar_datos.py); los nombres están en el deck anual.")
             with st.expander("Ver tablas"):
                 st.dataframe(pma.round(1), use_container_width=True, hide_index=True)
                 st.dataframe(da["ranking"][["Docente", "horas", "cursos", "meses"]].round(1),
